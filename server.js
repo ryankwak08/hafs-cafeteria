@@ -231,7 +231,19 @@ app.post("/kakao", async (req, res) => {
         });
 
     if (!filteredRows.length) {
-      return res.json(kakaoTextWithButtons("급식 정보가 없습니다."));
+      if (meal === "all") {
+        return res.json(
+          kakaoTextWithButtons(
+            "해당 날짜의 급식 정보가 아직 등록되지 않았거나 제공되지 않는 날입니다."
+          )
+        );
+      } else {
+        return res.json(
+          kakaoTextWithButtons(
+            `🍽 ${mealNameKo(meal)} 정보가 아직 등록되지 않았거나 오늘은 제공되지 않습니다.`
+          )
+        );
+      }
     }
 
     // 날짜별로 묶어서 출력(주간일 때도 보기 좋게)
