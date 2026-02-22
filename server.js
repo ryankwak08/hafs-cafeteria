@@ -1,6 +1,8 @@
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
+import * as cheerio from "cheerio";
+import iconv from "iconv-lite";
 
 dotenv.config();
 
@@ -111,6 +113,155 @@ function cleanDishText(raw) {
   return lines.join("\n");
 }
 
+// ====== HAFS 사이트에서 석식 가져오기(NEIS 지연 보완) ======
+function ymdToDot(ymd) {
+  // YYYYMMDD -> YYYY.MM.DD
+  return `${ymd.slice(0, 4)}.${ymd.slice(4, 6)}.${ymd.slice(6, 8)}`;
+}
+
+function cleanHafsText(text) {
+  if (!text) return "";
+
+  // 석식 블록에서 같이 딸려오는 영양표/라벨 제거
+  const dropPhrases = [
+    "에너지",
+    "탄수화물",
+    "단백질",
+    "지방",
+    "칼슘",
+    "kcal",
+    // ⚠️ 'mg', 'g' 같은 단위는 메뉴 텍스트에도 자주 섞여서 오탐이 많아 제외
+  ];
+
+  const lines = text
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((l) => l.replace(/\s+/g, " ").trim())
+    .filter((l) => l.length > 0)
+    .filter((l) => !dropPhrases.some((p) => l.includes(p)));
+
+  // 너무 짧은 한두 글자 라벨 제거(조/중/석 같은 배지)
+  const cleaned = lines.filter((l) => l.length >= 2);
+
+  // 중복 제거
+  const uniq = [];
+  const seen = new Set();
+  for (const l of cleaned) {
+    if (!seen.has(l)) {
+      seen.add(l);
+      uniq.push(l);
+    }
+  }
+
+  return uniq.join("\n").trim();
+}
+
+function extractHafsMealSection(joinedText, label) {
+  // label: "석식" or "야식" etc.
+  const idx = joinedText.lastIndexOf(label);
+  if (idx < 0) return null;
+
+  const after = joinedText.slice(idx + label.length);
+
+  // 메뉴가 끝나고 영양정보/다른 식사 라벨이 시작되는 지점에서 컷
+  const stopKeys = [
+    "에너지",
+    "탄수화물",
+    "단백질",
+    "지방",
+    "칼슘",
+    "kcal",
+    // 다른 식사 라벨(섞임 방지)
+    "조식",
+    "중식",
+    "석식",
+    // ⚠️ '야식'은 석식 블록 안에 '<야식>'로 포함될 수 있어서 여기서 자르면 안 됨
+  ].filter((k) => k !== label); // 자기 자신은 제외
+
+  let end = after.length;
+  for (const k of stopKeys) {
+    const j = after.indexOf(k);
+    if (j >= 0 && j < end) end = j;
+  }
+
+  const block = after.slice(0, end);
+  const cleaned = cleanHafsText(block);
+  return cleaned || null;
+}
+
+async function fetchMealsFromHafsSite(targetYmd) {
+  const monthParam = ymdToDot(targetYmd);
+  const url = `https://hafs.hs.kr/?act=lunch.main2&code=171113&month=${monthParam}`;
+
+  const resp = await axios.get(url, {
+    responseType: "arraybuffer",
+    headers: { "User-Agent": "Mozilla/5.0" },
+    timeout: 10000,
+  });
+
+  let html = "";
+  try {
+    html = iconv.decode(Buffer.from(resp.data), "euc-kr");
+  } catch {
+    html = Buffer.from(resp.data).toString("utf-8");
+  }
+
+  // script/style 제거
+  const noScript = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "");
+
+  // ⚠️ `<야식>`이 HTML 태그처럼 보여서 `<[^>]+>` 정규식에 의해 통째로 사라질 수 있음
+  // 먼저 `<야식>` / `&lt;야식&gt;`를 안전한 플레이스홀더로 바꿔둔 뒤 텍스트화하고,
+  // 마지막에 다시 `<야식>`으로 복원한다.
+  const YA_PLACEHOLDER = "__YA_SNACK__";
+
+  let text = noScript
+    // 엔티티 먼저 처리
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    // &lt;야식&gt; 형태도 잡기
+    .replace(/&lt;\s*야식\s*&gt;/gi, `\n${YA_PLACEHOLDER}\n`)
+    // 혹시 이미 <야식> 형태로 들어온 경우도 잡기 (태그 제거 전에!)
+    .replace(/<\s*야식\s*>/gi, `\n${YA_PLACEHOLDER}\n`)
+    // 줄바꿈 의미 태그 -> \n
+    .replace(/<br\s*\/?\s*>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|td|th|h\d)>/gi, "\n")
+    // 나머지 태그 제거
+    .replace(/<[^>]+>/g, "")
+    // 남아있는 엔티티 처리
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\r/g, "")
+    // 플레이스홀더 복원
+    .replace(new RegExp(YA_PLACEHOLDER, "g"), "<야식>");
+
+  const lines = text
+    .split("\n")
+    .map((l) => l.replace(/\s+/g, " ").trim())
+    .filter((l) => l.length > 0);
+
+  const joined = lines.join("\n");
+
+  const dinnerAll = extractHafsMealSection(joined, "석식");
+
+  // 기본값
+  let dinner = dinnerAll;
+  let late = null;
+
+  // 석식 블록 안에 '<야식>'이 실제로 포함된 경우: 석식/야식 분리
+  if (dinnerAll && dinnerAll.includes("<야식>")) {
+    const parts = dinnerAll.split("<야식>");
+    const dinnerPart = (parts[0] || "").trim();
+    const latePart = (parts.slice(1).join("\n") || "").trim();
+
+    dinner = dinnerPart ? cleanHafsText(dinnerPart) : null;
+    late = latePart ? cleanHafsText(latePart) : null;
+  }
+
+  return { dinner, late };
+}
+
 // ====== NEIS 급식 호출 ======
 async function fetchMeals(fromYmd, toYmd) {
   const url = `${NEIS_BASE}/mealServiceDietInfo`;
@@ -217,7 +368,71 @@ app.post("/kakao", async (req, res) => {
       to = from;
     }
 
+    // ====== 석식은 NEIS 업로드가 늦을 수 있어 학교 홈페이지에서 우선 시도 ======
+    // (저녁 버튼은 기본적으로 오늘 석식 요청)
+    if (meal === "dinner" && from === to) {
+      try {
+        const { dinner, late } = await fetchMealsFromHafsSite(from);
+        if (dinner) {
+          const pretty = `${from.slice(0, 4)}-${from.slice(4, 6)}-${from.slice(6, 8)}`;
+
+          let combined = `🍽 석식\n📅 ${pretty}\n${dinner}`;
+
+          // 사이트에 <야식>이 실제로 포함되어 있으면 그대로 이어 붙임
+          if (late) {
+            combined += `\n\n<야식>\n${late}`;
+          }
+
+          return res.json(
+            kakaoTextWithButtons(combined)
+          );
+        }
+      } catch (e) {
+        // 실패하면 NEIS로 폴백
+        console.error("[dinner scrape failed]", e);
+      }
+    }
+
     const rows = await fetchMeals(from, to);
+
+    // ====== 전체 보기(today/tomorrow/week)에서도 석식+야식 보완 ======
+    // 각 날짜별로 석식이 필요한 경우 학교 사이트에서 추가 보완
+    const hafsDinnerMap = new Map(); // YYYYMMDD -> { dinner, late }
+
+    if (meal === "all") {
+      const daysToCheck = [];
+
+      if (from === to) {
+        daysToCheck.push(from);
+      } else {
+        // 주간일 경우 from~to 범위 일자 생성
+        let d = new Date(
+          Number(from.slice(0, 4)),
+          Number(from.slice(4, 6)) - 1,
+          Number(from.slice(6, 8))
+        );
+        const end = new Date(
+          Number(to.slice(0, 4)),
+          Number(to.slice(4, 6)) - 1,
+          Number(to.slice(6, 8))
+        );
+        while (d <= end) {
+          daysToCheck.push(yyyymmdd(d));
+          d = addDays(d, 1);
+        }
+      }
+
+      for (const day of daysToCheck) {
+        try {
+          const result = await fetchMealsFromHafsSite(day);
+          if (result?.dinner) {
+            hafsDinnerMap.set(day, result);
+          }
+        } catch (e) {
+          console.error("[weekly dinner scrape failed]", day, e);
+        }
+      }
+    }
 
     // meal 필터링
     const filteredRows = meal === "all"
@@ -248,17 +463,45 @@ app.post("/kakao", async (req, res) => {
 
     // 날짜별로 묶어서 출력(주간일 때도 보기 좋게)
     const byDate = new Map();
+    const dinnerAdded = new Set(); // YYYYMMDD: 석식(사이트 보완 포함) 추가 여부
     for (const r of filteredRows) {
       const day = r.MLSV_YMD; // YYYYMMDD
       const mealName = r.MMEAL_SC_NM; // 조식/중식/석식
       const dish = cleanDishText(r.DDISH_NM);
 
       if (!byDate.has(day)) byDate.set(day, []);
-      if (meal === "all") {
-        byDate.get(day).push(`• ${mealName}\n${dish}`);
+
+      // 전체 보기일 때 석식은 사이트 기준으로 덮어씀
+      if (meal === "all" && mealName.includes("석식") && hafsDinnerMap.has(day)) {
+        const { dinner, late } = hafsDinnerMap.get(day);
+        let combined = `• 석식\n${dinner}`;
+        if (late) {
+          combined += `\n\n<야식>\n${late}`;
+        }
+        byDate.get(day).push(combined);
+        dinnerAdded.add(day);
       } else {
-        // 특정 식사만 보는 경우: 식사명은 생략하고 메뉴만
-        byDate.get(day).push(dish);
+        if (meal === "all") {
+          byDate.get(day).push(`• ${mealName}\n${dish}`);
+        } else {
+          byDate.get(day).push(dish);
+        }
+      }
+    }
+
+    // NEIS에 석식이 아예 없을 때(업로드 지연)도 사이트 석식(+야식)을 추가로 붙여준다
+    if (meal === "all" && hafsDinnerMap.size > 0) {
+      for (const [day, info] of hafsDinnerMap.entries()) {
+        if (!byDate.has(day)) byDate.set(day, []);
+        if (dinnerAdded.has(day)) continue;
+
+        const { dinner, late } = info;
+        let combined = `• 석식\n${dinner}`;
+        if (late) {
+          combined += `\n\n<야식>\n${late}`;
+        }
+        byDate.get(day).push(combined);
+        dinnerAdded.add(day);
       }
     }
 
