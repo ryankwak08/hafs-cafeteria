@@ -60,6 +60,38 @@ async function mapWithConcurrency(items, limit, mapper) {
 // ====== HAFS 페이지 HTML 가져오기 (간단 캐시) ======
 const hafsHtmlCache = new Map(); // ymd -> { html, ts }
 
+// ====== 마지막 조회(식사/날짜) 저장: '식단 사진 보기' 버튼이 라벨로 들어오는 경우 대응 ======
+const lastSelection = new Map(); // userId -> { ymd, meal, ts }
+const LAST_TTL_MS = 10 * 60 * 1000;
+
+function getUserId(body) {
+  // Kakao OpenBuilder에서 들어오는 user id 필드가 환경마다 다를 수 있어 최대한 폭넓게 잡는다.
+  return (
+    body?.userRequest?.user?.id ||
+    body?.userRequest?.user?.userId ||
+    body?.userRequest?.user?.uuid ||
+    body?.userRequest?.user?.properties?.plusfriendUserKey ||
+    body?.userRequest?.user?.properties?.appUserId ||
+    "anon"
+  );
+}
+
+function saveLastSelection(userId, ymd, meal) {
+  if (!userId) return;
+  if (!ymd || !meal || meal === "all" || meal === "week") return;
+  lastSelection.set(userId, { ymd, meal, ts: Date.now() });
+}
+
+function loadLastSelection(userId) {
+  const v = lastSelection.get(userId);
+  if (!v) return null;
+  if (Date.now() - v.ts > LAST_TTL_MS) {
+    lastSelection.delete(userId);
+    return null;
+  }
+  return v;
+}
+
 function hafsPageUrl(targetYmd) {
   const monthParam = ymdToDot(targetYmd);
   return `https://hafs.hs.kr/?act=lunch.main2&code=171113&month=${monthParam}`;
@@ -245,11 +277,11 @@ function isRecognizedUtter(utter) {
   if (!u) return true; // 웰컴(빈 발화)은 메뉴로 처리하는 로직이 이미 있음
 
   // 정확히 일치하는 버튼/명령
-  const exact = new Set(["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주", "메뉴", "시작", "도움말"]);
+  const exact = new Set(["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주", "메뉴", "시작", "도움말", "사진", "식단 사진", "식단 사진 보기"]);
   if (exact.has(u)) return true;
 
   // 포함되는 키워드(조식/중식/석식, 주간 등)
-  const keywords = ["아침", "점심", "저녁", "조식", "중식", "석식", "오늘", "내일", "이번주", "이번 주", "주간", "메뉴", "시작", "도움말"];
+  const keywords = ["아침", "점심", "저녁", "조식", "중식", "석식", "오늘", "내일", "이번주", "이번 주", "주간", "메뉴", "시작", "도움말", "사진", "식단 사진"];
   return keywords.some((k) => u.includes(k));
 }
 
@@ -459,9 +491,10 @@ function menuQuickReplies() {
 }
 
 function photoQuickReplies(ymd, meal) {
-  // ymd: YYYYMMDD, meal: breakfast|lunch|dinner|all|week
+  // 카카오 오픈빌더에서 동적 문자열(예: 사진|20260224|breakfast)은 블록 매칭이 안 돼서
+  // 폴백(/menu)으로 튕길 수 있음. 라벨 고정 + 서버의 lastSelection 메모리로 처리.
   return [
-    { label: "식단 사진 보기", action: "message", messageText: `사진|${ymd}|${meal}` },
+    { label: "식단 사진 보기", action: "message", messageText: "식단 사진 보기" },
   ];
 }
 
@@ -574,13 +607,28 @@ app.post("/kakao", async (req, res) => {
       );
     }
 
+    const userId = getUserId(req.body);
     const { utter, when, meal } = parseKakaoRequest(req.body);
 
-    // ====== 사진 요청 처리: 사진|YYYYMMDD|meal ======
-    if (utter && utter.startsWith("사진|")) {
+    // ====== 사진 요청 처리: 사진|YYYYMMDD|meal 또는 라벨 기반(식단 사진 보기 등) ======
+    if (utter && (utter.startsWith("사진|") || utter === "사진" || utter === "식단 사진" || utter === "식단 사진 보기" || utter.includes("식단 사진"))) {
       const parts = utter.split("|");
-      const ymd = parts[1];
-      const mealCode = parts[2] || "all";
+      let ymd = parts[1];
+      let mealCode = parts[2] || "all";
+
+      // 라벨 기반(예: '식단 사진 보기')으로 들어오면 마지막 조회 기록을 사용
+      if (!ymd || !/^\d{8}$/.test(ymd)) {
+        const last = loadLastSelection(userId);
+        if (!last) {
+          return res.json(
+            kakaoTextWithButtons(
+              "사진을 보려면 먼저 '아침/점심/저녁' 중 하나를 눌러 식단을 확인한 뒤, 다시 '식단 사진 보기'를 눌러줘!"
+            )
+          );
+        }
+        ymd = last.ymd;
+        mealCode = last.meal;
+      }
       const pretty = `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
 
       if (mealCode === "week") {
@@ -655,6 +703,7 @@ app.post("/kakao", async (req, res) => {
             combined += `\n\n<야식>\n${late}`;
           }
 
+          saveLastSelection(userId, from, "dinner");
           return res.json(
             kakaoText(combined, photoQuickReplies(from, "dinner"))
           );
@@ -824,6 +873,7 @@ app.post("/kakao", async (req, res) => {
     }
 
     // 오늘/내일/아침/점심/저녁에서는 '식단 사진 보기' 버튼 1개만 제공
+    saveLastSelection(userId, from, meal);
     return res.json(kakaoText(header + text, photoQuickReplies(from, meal)));
   } catch (err) {
     console.error(err);
