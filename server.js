@@ -57,6 +57,157 @@ async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
+// ====== HAFS 페이지 HTML 가져오기 (간단 캐시) ======
+const hafsHtmlCache = new Map(); // ymd -> { html, ts }
+
+function hafsPageUrl(targetYmd) {
+  const monthParam = ymdToDot(targetYmd);
+  return `https://hafs.hs.kr/?act=lunch.main2&code=171113&month=${monthParam}`;
+}
+
+async function fetchHafsHtml(targetYmd) {
+  const cached = hafsHtmlCache.get(targetYmd);
+  const now = Date.now();
+  if (cached && now - cached.ts < 5 * 60 * 1000) {
+    return cached.html;
+  }
+
+  const url = hafsPageUrl(targetYmd);
+  const resp = await axios.get(url, {
+    responseType: "arraybuffer",
+    headers: { "User-Agent": "Mozilla/5.0" },
+    timeout: 2500,
+  });
+
+  let html = "";
+  try {
+    html = iconv.decode(Buffer.from(resp.data), "euc-kr");
+  } catch {
+    html = Buffer.from(resp.data).toString("utf-8");
+  }
+
+  hafsHtmlCache.set(targetYmd, { html, ts: now });
+  return html;
+}
+
+function absolutizeHafsUrl(src) {
+  if (!src) return null;
+  if (src.startsWith("http://") || src.startsWith("https://")) return src;
+  if (src.startsWith("//")) return `https:${src}`;
+  if (src.startsWith("/")) return `https://hafs.hs.kr${src}`;
+  return `https://hafs.hs.kr/${src}`;
+}
+
+function toAbsHafsUrl(u) {
+  if (!u) return null;
+  if (u.startsWith("http")) return u;
+  if (u.startsWith("?")) return `https://hafs.hs.kr/${u}`;
+  if (u.startsWith("/")) return `https://hafs.hs.kr${u}`;
+  return `https://hafs.hs.kr/${u}`;
+}
+
+async function fetchRealPhotoUrlFromPopup(popupUrl) {
+  const resp = await axios.get(popupUrl, {
+    responseType: "arraybuffer",
+    headers: { "User-Agent": "Mozilla/5.0", Referer: "https://hafs.hs.kr/" },
+    timeout: 2500,
+  });
+
+  let html = "";
+  try {
+    html = iconv.decode(Buffer.from(resp.data), "euc-kr");
+  } catch {
+    html = Buffer.from(resp.data).toString("utf-8");
+  }
+
+  const $ = cheerio.load(html);
+
+  // 팝업 안에 있는 '진짜 사진' img src 찾기
+  const imgEl = $("img").filter(function () {
+    const src = $(this).attr("src") || "";
+    return /\/hosts\//i.test(src) || /\/files\//i.test(src);
+  }).first();
+
+  const src = imgEl.attr("src") || null;
+  return absolutizeHafsUrl(src);
+}
+
+async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
+  // mealKo: 조식 | 중식 | 석식
+  const html = await fetchHafsHtml(targetYmd);
+  const $ = cheerio.load(html);
+
+// ✅ 0) 먼저 '사진 팝업' 링크를 찾는다 (가장 정확)
+const popupA = scope.find("a[href*='lunch.image_pop']").first();
+if (popupA.length) {
+  const href = popupA.attr("href") || "";
+  const popupUrl = toAbsHafsUrl(href);
+  if (popupUrl) {
+    const real = await fetchRealPhotoUrlFromPopup(popupUrl);
+    if (real && !isBad(real)) return real;
+  }
+}
+
+  // 1) mealKo 텍스트가 있는 후보들을 모두 훑으면서,
+  //    각 후보의 근처 컨테이너에서 '진짜 사진' img src를 찾아낸다.
+  const candidates = $(`*:contains('${mealKo}')`).toArray();
+
+  const isBad = (absUrl) => {
+    if (!absUrl) return true;
+    
+    // HAFS 공용 UI/아이콘/버튼 이미지 제외 (font-plus 같은 것)
+    if (/\/commons\/images\//i.test(absUrl)) return true;
+    if (/font-plus|icon|btn|button|global/i.test(absUrl)) return true;
+
+    // 식단 페이지 네비/버튼 gif (prev/next 등)
+    if (/\/image\/access\/foodList\//i.test(absUrl)) return true;
+    if (/prevMonth|nextMonth|today|cal|arrow/i.test(absUrl)) return true;
+
+    // 플레이스홀더/빈이미지 패턴
+    if (/noimg|blank|none|default/i.test(absUrl)) return true;
+    // 중식/석식의 회색 도시락 기본 그림 같은 경우가 많아서, 파일명이 plate/meal/box가 아닌데도
+    // 완전히 배제하면 오탐이 생길 수 있으니 위 패턴만 강하게 거른다.
+    return false;
+  };
+
+  for (const el of candidates) {
+    const t = $(el).text().replace(/\s+/g, " ").trim();
+    // 너무 큰 덩어리(페이지 전체) 매칭 방지
+    if (!(t === mealKo || t.startsWith(mealKo + " ") || t.includes(mealKo))) continue;
+
+    const container = $(el).closest(
+      ".meal, .mealBox, .meal_box, .lunch, .lunchBox, .lunch_box, table, tr, td, div, section, article"
+    );
+    const scope = container.length ? container : $(el).parent();
+
+    // img 후보를 여러 개 찾고, 첫 번째 유효한 src를 사용
+    const imgs = scope.find("img").toArray();
+    for (const imgEl of imgs) {
+      const src = $(imgEl).attr("src") || $(imgEl).attr("data-src") || null;
+      const abs = absolutizeHafsUrl(src);
+      if (!abs || isBad(abs)) continue;
+      return abs;
+    }
+  }
+
+  // 2) 그래도 못 찾으면, 페이지 전체에서 이미지 후보를 훑되
+  //    mealKo가 들어간 영역 근처(이름이 포함된 부모)만 좁혀서 시도
+  const globalImgs = $("img").toArray();
+  for (const imgEl of globalImgs) {
+    const src = $(imgEl).attr("src") || $(imgEl).attr("data-src") || null;
+    const abs = absolutizeHafsUrl(src);
+    if (!abs || isBad(abs)) continue;
+
+    // 이미지 주변 텍스트에 mealKo가 있으면 해당 이미지로 인정
+    const 주변텍스트 = $(imgEl).closest("div, td, tr, section, article").text();
+    if (주변텍스트 && 주변텍스트.includes(mealKo)) {
+      return abs;
+    }
+  }
+
+  return null;
+}
+
 // ====== 요청 파싱 (오픈빌더 파라미터 + 발화 둘 다 지원) ======
 function parseKakaoRequest(body) {
   const utter = (body?.userRequest?.utterance || "").trim();
@@ -212,21 +363,7 @@ function extractHafsMealSection(joinedText, label) {
 }
 
 async function fetchMealsFromHafsSite(targetYmd) {
-  const monthParam = ymdToDot(targetYmd);
-  const url = `https://hafs.hs.kr/?act=lunch.main2&code=171113&month=${monthParam}`;
-
-  const resp = await axios.get(url, {
-    responseType: "arraybuffer",
-    headers: { "User-Agent": "Mozilla/5.0" },
-    timeout: 2500,
-  });
-
-  let html = "";
-  try {
-    html = iconv.decode(Buffer.from(resp.data), "euc-kr");
-  } catch {
-    html = Buffer.from(resp.data).toString("utf-8");
-  }
+  const html = await fetchHafsHtml(targetYmd);
 
   // script/style 제거
   const noScript = html
@@ -305,7 +442,7 @@ async function fetchMeals(fromYmd, toYmd) {
   return block[1].row;
 }
 
-function mealQuickReplies() {
+function menuQuickReplies() {
   // 버튼 6개: 아침/점심/저녁/오늘/내일/이번주
   return [
     { label: "아침", action: "message", messageText: "아침" },
@@ -317,12 +454,47 @@ function mealQuickReplies() {
   ];
 }
 
-function kakaoTextWithButtons(text) {
+function photoQuickReplies(ymd, meal) {
+  // ymd: YYYYMMDD, meal: breakfast|lunch|dinner|all|week
+  return [
+    { label: "식단 사진 보기", action: "message", messageText: `사진|${ymd}|${meal}` },
+  ];
+}
+
+function kakaoText(text, quickReplies) {
   return {
     version: "2.0",
     template: {
       outputs: [{ simpleText: { text } }],
-      quickReplies: mealQuickReplies(),
+      ...(quickReplies ? { quickReplies } : {}),
+    },
+  };
+}
+
+const BASE_URL = process.env.BASE_URL || "https://hafs-cafeteria.onrender.com";
+
+function kakaoPhotoCards(titlePrefix, photos, fallbackText) {
+  if (!photos || photos.length === 0) {
+    // 사진이 없을 때도 버튼 없이 텍스트만
+    return kakaoText(fallbackText || "식단 사진이 없습니다.", null);
+  }
+
+  return {
+    version: "2.0",
+    template: {
+      outputs: photos.map((p) => {
+        const proxied = `${BASE_URL}/img?url=${encodeURIComponent(p.imageUrl)}`;
+        return {
+          basicCard: {
+            title: `${titlePrefix} ${p.title}`.trim(),
+            thumbnail: { imageUrl: proxied },
+            buttons: [
+              { action: "webLink", label: "원본 보기", webLinkUrl: proxied },
+            ],
+          },
+        };
+      }),
+      // ✅ 사진 화면에서는 quickReplies 없음!
     },
   };
 }
@@ -336,6 +508,39 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
+});
+
+// ====== 이미지 프록시 (HAFS 이미지 핫링크/차단 대응) ======
+app.get("/img", async (req, res) => {
+  try {
+    const url = String(req.query.url || "");
+    if (!url || !/^https?:\/\//i.test(url)) {
+      return res.status(400).send("Bad url");
+    }
+
+    // HAFS 도메인만 허용 (보안)
+    const u = new URL(url);
+    if (u.hostname !== "hafs.hs.kr") {
+      return res.status(403).send("Forbidden");
+    }
+
+    const resp = await axios.get(url, {
+      responseType: "arraybuffer",
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://hafs.hs.kr/"
+      },
+     timeout: 5000,
+    });
+
+    const ct = resp.headers["content-type"] || "image/jpeg";
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    return res.status(200).send(Buffer.from(resp.data));
+  } catch (e) {
+    console.error("[img proxy failed]", e);
+    return res.status(404).send("Not found");
+  }
 });
 
 // ====== 웰컴/메뉴 전용 엔드포인트 (항상 버튼만 보여줌) ======
@@ -363,11 +568,48 @@ app.post("/kakao", async (req, res) => {
 
     const { utter, when, meal } = parseKakaoRequest(req.body);
 
+    // ====== 사진 요청 처리: 사진|YYYYMMDD|meal ======
+    if (utter && utter.startsWith("사진|")) {
+      const parts = utter.split("|");
+      const ymd = parts[1];
+      const mealCode = parts[2] || "all";
+      const pretty = `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+
+      if (mealCode === "week") {
+        return res.json(
+          kakaoTextWithButtons(
+            "주간 보기에서는 날짜가 여러 개라 사진을 한 번에 보여주기 어려워요.\n\n'오늘/내일' 또는 '아침/점심/저녁'을 눌러서 날짜/식사를 선택한 뒤, 다시 '식단 사진 보기'를 눌러줘!"
+          )
+        );
+      }
+
+      const photos = [];
+
+      const addPhoto = async (koName) => {
+        const url = await fetchMealPhotoFromHafsSite(ymd, koName);
+        if (url) photos.push({ title: `(${pretty}) ${koName}`, imageUrl: url });
+      };
+
+      if (mealCode === "breakfast") await addPhoto("조식");
+      else if (mealCode === "lunch") await addPhoto("중식");
+      else if (mealCode === "dinner") await addPhoto("석식");
+      else {
+        // all
+        await addPhoto("조식");
+        await addPhoto("중식");
+        await addPhoto("석식");
+      }
+
+      return res.json(
+        kakaoPhotoCards("📷", photos, "식단 사진이 없습니다.")
+      );
+    }
+
     // 웰컴/메뉴 진입용 + 저장된 발화/버튼 외 입력이면 메뉴로 유도
     if (!utter || utter === "메뉴" || utter === "시작" || utter === "도움말" || !isRecognizedUtter(utter)) {
       return res.json(
         kakaoTextWithButtons(
-          "원하는 버튼을 눌러 급식을 확인해줘!\n\n• 아침/점심/저녁: 오늘 해당 식사\n• 오늘/내일/이번주: 전체 식단"
+          "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사\n• 오늘/내일/이번주: 전체 식단"
         )
       );
     }
@@ -406,7 +648,7 @@ app.post("/kakao", async (req, res) => {
           }
 
           return res.json(
-            kakaoTextWithButtons(combined)
+            kakaoText(combined, photoQuickReplies(from, "dinner"))
           );
         }
       } catch (e) {
@@ -496,7 +738,7 @@ app.post("/kakao", async (req, res) => {
           })
           .join("\n\n──────────\n\n");
 
-        return res.json(kakaoTextWithButtons(text));
+        return res.json(kakaoText(text, null));
       }
 
       if (meal === "all") {
@@ -567,7 +809,14 @@ app.post("/kakao", async (req, res) => {
       .join("\n\n──────────\n\n");
 
     const header = meal === "all" ? "" : `🍽 ${mealNameKo(meal)}\n`;
-    return res.json(kakaoTextWithButtons(header + text));
+
+    // 결과 화면: 주간(이번주)에서는 '식단 사진 보기' 버튼을 노출하지 않음
+    if (when === "week" || meal === "all") {
+      return res.json(kakaoText(header + text, null));
+    }
+
+    // 오늘/내일/아침/점심/저녁에서는 '식단 사진 보기' 버튼 1개만 제공
+    return res.json(kakaoText(header + text, photoQuickReplies(from, meal)));
   } catch (err) {
     console.error(err);
     return res.json(kakaoTextWithButtons("급식 불러오다가 오류가 났어. 잠시 후 다시 시도해줘!"));
