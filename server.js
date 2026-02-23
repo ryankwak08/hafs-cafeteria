@@ -35,6 +35,28 @@ function startOfWeekMonday(date) {
   return d;
 }
 
+// ====== 간단한 동시성 제한 유틸 (Kakao 응답 시간 제한 대응) ======
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let i = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      try {
+        results[idx] = await mapper(items[idx], idx);
+      } catch (e) {
+        results[idx] = e;
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 // ====== 요청 파싱 (오픈빌더 파라미터 + 발화 둘 다 지원) ======
 function parseKakaoRequest(body) {
   const utter = (body?.userRequest?.utterance || "").trim();
@@ -196,7 +218,7 @@ async function fetchMealsFromHafsSite(targetYmd) {
   const resp = await axios.get(url, {
     responseType: "arraybuffer",
     headers: { "User-Agent": "Mozilla/5.0" },
-    timeout: 10000,
+    timeout: 2500,
   });
 
   let html = "";
@@ -422,14 +444,18 @@ app.post("/kakao", async (req, res) => {
         }
       }
 
-      for (const day of daysToCheck) {
-        try {
-          const result = await fetchMealsFromHafsSite(day);
-          if (result?.dinner) {
-            hafsDinnerMap.set(day, result);
-          }
-        } catch (e) {
-          console.error("[weekly dinner scrape failed]", day, e);
+      // Kakao는 응답 제한 시간이 짧아서(타임아웃/무응답 방지)
+      // 주간 요청은 동시성 제한(예: 3개)으로 빠르게 긁어온다.
+      const settled = await mapWithConcurrency(daysToCheck, 3, async (day) => {
+        const result = await fetchMealsFromHafsSite(day);
+        return { day, result };
+      });
+
+      for (const s of settled) {
+        if (!s || s instanceof Error) continue;
+        const { day, result } = s;
+        if (result?.dinner) {
+          hafsDinnerMap.set(day, result);
         }
       }
     }
@@ -446,6 +472,33 @@ app.post("/kakao", async (req, res) => {
         });
 
     if (!filteredRows.length) {
+      // NEIS가 주간/전체에서 데이터를 안 주는 경우가 있어도,
+      // 학교 사이트에서 긁어온 석식(+야식)이 있으면 그걸로라도 보여준다.
+      if (meal === "all" && hafsDinnerMap.size > 0) {
+        const byDate = new Map();
+
+        for (const [day, info] of hafsDinnerMap.entries()) {
+          if (!byDate.has(day)) byDate.set(day, []);
+          const { dinner, late } = info;
+
+          let combined = `• 석식\n${dinner}`;
+          if (late) {
+            combined += `\n\n<야식>\n${late}`;
+          }
+          byDate.get(day).push(combined);
+        }
+
+        const days = [...byDate.keys()].sort();
+        const text = days
+          .map((d) => {
+            const pretty = `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+            return `📅 ${pretty}\n${byDate.get(d).join("\n\n")}`;
+          })
+          .join("\n\n──────────\n\n");
+
+        return res.json(kakaoTextWithButtons(text));
+      }
+
       if (meal === "all") {
         return res.json(
           kakaoTextWithButtons(
