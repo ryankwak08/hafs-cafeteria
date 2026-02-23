@@ -137,17 +137,6 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
   const html = await fetchHafsHtml(targetYmd);
   const $ = cheerio.load(html);
 
-// ✅ 0) 먼저 '사진 팝업' 링크를 찾는다 (가장 정확)
-const popupA = scope.find("a[href*='lunch.image_pop']").first();
-if (popupA.length) {
-  const href = popupA.attr("href") || "";
-  const popupUrl = toAbsHafsUrl(href);
-  if (popupUrl) {
-    const real = await fetchRealPhotoUrlFromPopup(popupUrl);
-    if (real && !isBad(real)) return real;
-  }
-}
-
   // 1) mealKo 텍스트가 있는 후보들을 모두 훑으면서,
   //    각 후보의 근처 컨테이너에서 '진짜 사진' img src를 찾아낸다.
   const candidates = $(`*:contains('${mealKo}')`).toArray();
@@ -179,6 +168,21 @@ if (popupA.length) {
       ".meal, .mealBox, .meal_box, .lunch, .lunchBox, .lunch_box, table, tr, td, div, section, article"
     );
     const scope = container.length ? container : $(el).parent();
+
+    // ✅ 0) 먼저 '사진 팝업' 링크를 찾는다 (가장 정확)
+    const popupA = scope.find("a[href*='lunch.image_pop']").first();
+    if (popupA.length) {
+      const href = popupA.attr("href") || "";
+      const popupUrl = toAbsHafsUrl(href);
+      if (popupUrl) {
+        try {
+          const real = await fetchRealPhotoUrlFromPopup(popupUrl);
+          if (real && !isBad(real)) return real;
+        } catch {
+          // 팝업 파싱 실패 시 아래 img 스캔으로 폴백
+        }
+      }
+    }
 
     // img 후보를 여러 개 찾고, 첫 번째 유효한 src를 사용
     const imgs = scope.find("img").toArray();
@@ -469,6 +473,10 @@ function kakaoText(text, quickReplies) {
       ...(quickReplies ? { quickReplies } : {}),
     },
   };
+}
+
+function kakaoTextWithButtons(text) {
+  return kakaoText(text, menuQuickReplies());
 }
 
 const BASE_URL = process.env.BASE_URL || "https://hafs-cafeteria.onrender.com";
