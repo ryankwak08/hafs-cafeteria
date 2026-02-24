@@ -184,8 +184,8 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
     if (/\/image\/access\/foodList\//i.test(absUrl)) return true;
     if (/prevMonth|nextMonth|today|cal|arrow/i.test(absUrl)) return true;
 
-    // 플레이스홀더/빈이미지 패턴
-    if (/noimg|blank|none|default/i.test(absUrl)) return true;
+    // 플레이스홀더/빈이미지 패턴 (학교 사이트 기본 'no_foodimg.gif' 포함)
+    if (/noimg|no_foodimg|blank|none|default/i.test(absUrl)) return true;
     // 중식/석식의 회색 도시락 기본 그림 같은 경우가 많아서, 파일명이 plate/meal/box가 아닌데도
     // 완전히 배제하면 오탐이 생길 수 있으니 위 패턴만 강하게 거른다.
     return false;
@@ -196,10 +196,29 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
     // 너무 큰 덩어리(페이지 전체) 매칭 방지
     if (!(t === mealKo || t.startsWith(mealKo + " ") || t.includes(mealKo))) continue;
 
-    const container = $(el).closest(
-      ".meal, .mealBox, .meal_box, .lunch, .lunchBox, .lunch_box, table, tr, td, div, section, article"
+    // ✅ 가장 정확한 범위는 '라벨이 있는 셀(td/th)'.
+    // 점심 사진이 없을 때 같은 날짜의 조식 사진을 주워오는 문제를 막기 위해
+    // td/th 안에서만 팝업 링크/이미지를 먼저 찾는다.
+    const cellScope = $(el).closest("td, th");
+
+    const rowScope = $(el).closest(
+      "tr, li, .meal, .mealBox, .meal_box, .lunch, .lunchBox, .lunch_box"
     );
-    const scope = container.length ? container : $(el).parent();
+
+    const container = $(el).closest(
+      "table, tr, td, div, section, article"
+    );
+
+    const scope = cellScope.length
+      ? cellScope
+      : (rowScope.length ? rowScope : (container.length ? container : $(el).parent()));
+
+    // cellScope가 아닌 큰 범위를 쓰는 경우, 다른 식사 라벨이 섞여 있으면 안전하게 스킵
+    if (!cellScope.length) {
+      const st = scope.text();
+      if (mealKo === "중식" && st.includes("조식")) continue;
+      if (mealKo === "석식" && (st.includes("조식") || st.includes("중식"))) continue;
+    }
 
     // ✅ 0) 먼저 '사진 팝업' 링크를 찾는다 (가장 정확)
     const popupA = scope.find("a[href*='lunch.image_pop']").first();
@@ -216,6 +235,21 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
       }
     }
 
+    // 중식/석식 사진이 실제로 없는 경우, 같은 날짜의 다른 섹션(조식 등)에 있는 이미지를
+    // 아래 img 스캔이 잘못 집을 수 있으므로 scope가 너무 커졌다고 판단되면 스킵
+    // (rowScope가 잡힌 경우에는 이미 충분히 좁으므로 그대로 진행)
+    if (!rowScope.length) {
+      const scopeText = scope.text();
+      // scope 안에 다른 식사 라벨이 함께 섞여 있으면(조식/중식/석식이 같이 있으면) 너무 넓은 범위로 본다
+      const hasBreakfast = scopeText.includes("조식");
+      const hasLunch = scopeText.includes("중식");
+      const hasDinner = scopeText.includes("석식");
+      const count = [hasBreakfast, hasLunch, hasDinner].filter(Boolean).length;
+      if (count >= 2) {
+        continue;
+      }
+    }
+
     // img 후보를 여러 개 찾고, 첫 번째 유효한 src를 사용
     const imgs = scope.find("img").toArray();
     for (const imgEl of imgs) {
@@ -226,8 +260,13 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
     }
   }
 
-  // 2) 그래도 못 찾으면, 페이지 전체에서 이미지 후보를 훑되
-  //    mealKo가 들어간 영역 근처(이름이 포함된 부모)만 좁혀서 시도
+  // 2) 그래도 못 찾으면,
+  // 조식(아침)은 보통 사진이 있는 날이 많고, 페이지 구조상 안전한 전역 폴백이 가능하지만
+  // 중식/석식은 사진이 없을 때 같은 날짜의 다른 식사(조식) 사진을 잘못 집기 쉬워서 전역 폴백을 금지한다.
+  if (mealKo !== "조식") {
+    return null;
+  }
+
   const globalImgs = $("img").toArray();
   for (const imgEl of globalImgs) {
     const src = $(imgEl).attr("src") || $(imgEl).attr("data-src") || null;
