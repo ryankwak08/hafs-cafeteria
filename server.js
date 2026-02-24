@@ -60,6 +60,10 @@ async function mapWithConcurrency(items, limit, mapper) {
 // ====== HAFS 페이지 HTML 가져오기 (간단 캐시) ======
 const hafsHtmlCache = new Map(); // ymd -> { html, ts }
 
+// ====== 식단 사진 URL 캐시 (스크래핑/팝업 호출 최소화) ======
+const photoUrlCache = new Map(); // key: `${ymd}|${mealKo}` -> { url: string|null, ts }
+const PHOTO_CACHE_TTL_MS = 30 * 60 * 1000; // 30분
+
 // ====== 마지막 조회(식사/날짜) 저장: '식단 사진 보기' 버튼이 라벨로 들어오는 경우 대응 ======
 const lastSelection = new Map(); // userId -> { ymd, meal, ts }
 const LAST_TTL_MS = 10 * 60 * 1000;
@@ -166,6 +170,12 @@ async function fetchRealPhotoUrlFromPopup(popupUrl) {
 
 async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
   // mealKo: 조식 | 중식 | 석식
+  const cacheKey = `${targetYmd}|${mealKo}`;
+  const cached = photoUrlCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.ts < PHOTO_CACHE_TTL_MS) {
+    return cached.url;
+  }
   const html = await fetchHafsHtml(targetYmd);
   const $ = cheerio.load(html);
 
@@ -228,7 +238,10 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
       if (popupUrl) {
         try {
           const real = await fetchRealPhotoUrlFromPopup(popupUrl);
-          if (real && !isBad(real)) return real;
+          if (real && !isBad(real)) {
+            photoUrlCache.set(cacheKey, { url: real, ts: Date.now() });
+            return real;
+          }
         } catch {
           // 팝업 파싱 실패 시 아래 img 스캔으로 폴백
         }
@@ -256,6 +269,7 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
       const src = $(imgEl).attr("src") || $(imgEl).attr("data-src") || null;
       const abs = absolutizeHafsUrl(src);
       if (!abs || isBad(abs)) continue;
+      photoUrlCache.set(cacheKey, { url: abs, ts: Date.now() });
       return abs;
     }
   }
@@ -264,6 +278,7 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
   // 조식(아침)은 보통 사진이 있는 날이 많고, 페이지 구조상 안전한 전역 폴백이 가능하지만
   // 중식/석식은 사진이 없을 때 같은 날짜의 다른 식사(조식) 사진을 잘못 집기 쉬워서 전역 폴백을 금지한다.
   if (mealKo !== "조식") {
+    photoUrlCache.set(cacheKey, { url: null, ts: Date.now() });
     return null;
   }
 
@@ -276,10 +291,12 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
     // 이미지 주변 텍스트에 mealKo가 있으면 해당 이미지로 인정
     const 주변텍스트 = $(imgEl).closest("div, td, tr, section, article").text();
     if (주변텍스트 && 주변텍스트.includes(mealKo)) {
+      photoUrlCache.set(cacheKey, { url: abs, ts: Date.now() });
       return abs;
     }
   }
 
+  photoUrlCache.set(cacheKey, { url: null, ts: Date.now() });
   return null;
 }
 
@@ -555,26 +572,39 @@ const BASE_URL = process.env.BASE_URL || "https://hafs-cafeteria.onrender.com";
 
 function kakaoPhotoCards(titlePrefix, photos, fallbackText) {
   if (!photos || photos.length === 0) {
-    // 사진이 없을 때도 버튼 없이 텍스트만
+    // 사진이 없을 때는 버튼 없이 텍스트만
     return kakaoText(fallbackText || "식단 사진이 없습니다.", null);
+  }
+
+  // Kakao는 '파일 자체 업로드'를 스킬 응답으로 직접 보내는 걸 지원하지 않고,
+  // 반드시 imageUrl을 통해 이미지를 불러오게 되어 있어요.
+  // 대신 simpleImage를 쓰면 카톡 대화창에 이미지가 바로 표시됩니다.
+  const outputs = [];
+
+  for (const p of photos) {
+    const proxied = `${BASE_URL}/img?url=${encodeURIComponent(p.imageUrl)}`;
+
+    // 캡션(제목)
+    outputs.push({
+      simpleText: {
+        text: `${titlePrefix} ${p.title}`.trim(),
+      },
+    });
+
+    // 이미지 본문
+    outputs.push({
+      simpleImage: {
+        imageUrl: proxied,
+        altText: `${p.title}`.trim(),
+      },
+    });
   }
 
   return {
     version: "2.0",
     template: {
-      outputs: photos.map((p) => {
-        const proxied = `${BASE_URL}/img?url=${encodeURIComponent(p.imageUrl)}`;
-        return {
-          basicCard: {
-            title: `${titlePrefix} ${p.title}`.trim(),
-            thumbnail: { imageUrl: proxied },
-            buttons: [
-              { action: "webLink", label: "원본 보기", webLinkUrl: proxied },
-            ],
-          },
-        };
-      }),
-      // ✅ 사진 화면에서는 quickReplies 없음!
+      outputs,
+      // ✅ 사진 화면에서는 quickReplies 없음
     },
   };
 }
@@ -661,7 +691,7 @@ app.post("/kakao", async (req, res) => {
         if (!last) {
           return res.json(
             kakaoTextWithButtons(
-              "사진을 보려면 먼저 '아침/점심/저녁' 중 하나를 눌러 식단을 확인한 뒤, 다시 '식단 사진 보기'를 눌러줘!"
+              "사진을 보려면 먼저 '아침/점심/저녁' 중 하나를 눌러 식단을 확인한 뒤, 다시 '식단 사진 보기'를 눌러주세요."
             )
           );
         }
@@ -919,6 +949,14 @@ app.post("/kakao", async (req, res) => {
     return res.json(kakaoTextWithButtons("급식 불러오다가 오류가 났어. 잠시 후 다시 시도해줘!"));
   }
 });
+
+// ====== Render 등 무료 호스팅 콜드스타트 완화용(선택) ======
+// SELF_PING=1 로 설정하면 서버가 주기적으로 /health 를 호출해 잠들지 않게 시도한다.
+if (process.env.SELF_PING === "1" && process.env.NODE_ENV === "production") {
+  setInterval(() => {
+    axios.get(`${BASE_URL}/health`, { timeout: 2000 }).catch(() => {});
+  }, 4 * 60 * 1000);
+}
 
 // ====== 실행 ======
 const PORT = process.env.PORT || 3000;
