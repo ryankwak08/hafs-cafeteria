@@ -64,6 +64,10 @@ const hafsHtmlCache = new Map(); // ymd -> { html, ts }
 const photoUrlCache = new Map(); // key: `${ymd}|${mealKo}` -> { url: string|null, ts }
 const PHOTO_CACHE_TTL_MS = 30 * 60 * 1000; // 30분
 
+// ====== 이미지 프록시 버퍼 캐시 (Kakao 이미지 로딩 안정화) ======
+const imgProxyCache = new Map(); // key: url -> { buf: Buffer, ct: string, ts: number }
+const IMG_CACHE_TTL_MS = 60 * 60 * 1000; // 1시간
+
 // ====== 마지막 조회(식사/날짜) 저장: '식단 사진 보기' 버튼이 라벨로 들어오는 경우 대응 ======
 const lastSelection = new Map(); // userId -> { ymd, meal, ts }
 const LAST_TTL_MS = 10 * 60 * 1000;
@@ -641,13 +645,29 @@ app.get("/img", async (req, res) => {
       return res.status(403).send("Forbidden");
     }
 
+    // Cache hit
+    const cached = imgProxyCache.get(url);
+    const now = Date.now();
+    if (cached && now - cached.ts < IMG_CACHE_TTL_MS) {
+      res.setHeader("Content-Type", cached.ct || "image/jpeg");
+      res.setHeader("Content-Disposition", "inline");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Length", String(cached.buf.length));
+      // 가벼운 로그
+      console.log(`[img] cache hit ${u.pathname}`);
+      return res.status(200).send(cached.buf);
+    }
+
+    console.log(`[img] fetch ${u.pathname}`);
+
     const resp = await axios.get(url, {
       responseType: "arraybuffer",
       headers: {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://hafs.hs.kr/"
       },
-     timeout: 5000,
+      timeout: 5000,
     });
 
     // Kakao는 Content-Type이 image/* 가 아니면 이미지를 표시하지 않는 경우가 있음.
@@ -655,12 +675,18 @@ app.get("/img", async (req, res) => {
     const rawCt = String(resp.headers["content-type"] || "").toLowerCase();
     const ct = rawCt.startsWith("image/") ? rawCt : "image/jpeg";
 
+    const buf = Buffer.from(resp.data);
+
     res.setHeader("Content-Type", ct);
     res.setHeader("Content-Disposition", "inline");
     res.setHeader("Cache-Control", "public, max-age=3600");
     res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Content-Length", String(buf.length));
 
-    return res.status(200).send(Buffer.from(resp.data));
+    // store cache (only if it looks like an image)
+    imgProxyCache.set(url, { buf, ct, ts: Date.now() });
+
+    return res.status(200).send(buf);
   } catch (e) {
     console.error("[img proxy failed]", e);
     return res.status(404).send("Not found");
