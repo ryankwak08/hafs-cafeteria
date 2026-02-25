@@ -532,10 +532,11 @@ function menuQuickReplies() {
 }
 
 function photoQuickReplies(ymd, meal) {
-  // 카카오 오픈빌더에서 동적 문자열(예: 사진|20260224|breakfast)은 블록 매칭이 안 돼서
-  // 폴백(/menu)으로 튕길 수 있음. 라벨 고정 + 서버의 lastSelection 메모리로 처리.
+  // OpenBuilder에서 특정 문구가 다른 블록으로 라우팅되거나 매칭이 꼬일 수 있어
+  // 버튼 라벨은 그대로 두고, 실제 발화는 짧고 안정적인 '사진'으로 보낸다.
+  // 서버는 lastSelection 메모리로 어떤 날짜/식사 사진인지 알아서 처리한다.
   return [
-    { label: "식단 사진 보기", action: "message", messageText: "식단 사진 보기" },
+    { label: "식단 사진 보기", action: "message", messageText: "사진" },
   ];
 }
 
