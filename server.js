@@ -628,9 +628,16 @@ app.get("/img", async (req, res) => {
      timeout: 5000,
     });
 
-    const ct = resp.headers["content-type"] || "image/jpeg";
+    // Kakao는 Content-Type이 image/* 가 아니면 이미지를 표시하지 않는 경우가 있음.
+    // HAFS의 일부 파일은 확장자가 없거나 Content-Type이 비정상으로 올 수 있어 방어적으로 처리한다.
+    const rawCt = String(resp.headers["content-type"] || "").toLowerCase();
+    const ct = rawCt.startsWith("image/") ? rawCt : "image/jpeg";
+
     res.setHeader("Content-Type", ct);
+    res.setHeader("Content-Disposition", "inline");
     res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
     return res.status(200).send(Buffer.from(resp.data));
   } catch (e) {
     console.error("[img proxy failed]", e);
