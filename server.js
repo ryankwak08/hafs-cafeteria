@@ -244,6 +244,27 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
     const popupA = scope.find("a[href*='lunch.image_pop']").first();
     if (popupA.length) {
       const href = popupA.attr("href") || "";
+
+      // ✅ (빠름) href에 img=/hosts/... 가 이미 들어있는 경우가 많다.
+      // 이때는 팝업 페이지를 다시 요청하지 말고 img 파라미터를 그대로 사용한다.
+      try {
+        const absPopup = toAbsHafsUrl(href);
+        if (absPopup) {
+          const u = new URL(absPopup);
+          const imgParam = u.searchParams.get("img");
+          if (imgParam) {
+            const direct = absolutizeHafsUrl(imgParam);
+            if (direct && !isBad(direct)) {
+              photoUrlCache.set(cacheKey, { url: direct, ts: Date.now() });
+              return direct;
+            }
+          }
+        }
+      } catch {
+        // URL 파싱 실패 시 아래 폴백으로
+      }
+
+      // (폴백) 그래도 없으면 팝업 HTML을 열어서 img src를 파싱
       const popupUrl = toAbsHafsUrl(href);
       if (popupUrl) {
         try {
