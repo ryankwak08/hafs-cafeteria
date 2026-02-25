@@ -230,7 +230,17 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
       if (mealKo === "석식" && (st.includes("조식") || st.includes("중식"))) continue;
     }
 
-    // ✅ 0) 먼저 '사진 팝업' 링크를 찾는다 (가장 정확)
+    // ✅ 0) 먼저 현재 페이지의 img를 훑어서 '진짜 사진'이 있으면 그걸 사용 (팝업 호출 1회 절약)
+    const imgs = scope.find("img").toArray();
+    for (const imgEl of imgs) {
+      const src = $(imgEl).attr("src") || $(imgEl).attr("data-src") || null;
+      const abs = absolutizeHafsUrl(src);
+      if (!abs || isBad(abs)) continue;
+      photoUrlCache.set(cacheKey, { url: abs, ts: Date.now() });
+      return abs;
+    }
+
+    // ✅ 1) img가 없으면 '사진 팝업' 링크를 통해 진짜 사진 URL을 가져온다
     const popupA = scope.find("a[href*='lunch.image_pop']").first();
     if (popupA.length) {
       const href = popupA.attr("href") || "";
@@ -243,34 +253,9 @@ async function fetchMealPhotoFromHafsSite(targetYmd, mealKo) {
             return real;
           }
         } catch {
-          // 팝업 파싱 실패 시 아래 img 스캔으로 폴백
+          // 팝업 파싱 실패 시 무시
         }
       }
-    }
-
-    // 중식/석식 사진이 실제로 없는 경우, 같은 날짜의 다른 섹션(조식 등)에 있는 이미지를
-    // 아래 img 스캔이 잘못 집을 수 있으므로 scope가 너무 커졌다고 판단되면 스킵
-    // (rowScope가 잡힌 경우에는 이미 충분히 좁으므로 그대로 진행)
-    if (!rowScope.length) {
-      const scopeText = scope.text();
-      // scope 안에 다른 식사 라벨이 함께 섞여 있으면(조식/중식/석식이 같이 있으면) 너무 넓은 범위로 본다
-      const hasBreakfast = scopeText.includes("조식");
-      const hasLunch = scopeText.includes("중식");
-      const hasDinner = scopeText.includes("석식");
-      const count = [hasBreakfast, hasLunch, hasDinner].filter(Boolean).length;
-      if (count >= 2) {
-        continue;
-      }
-    }
-
-    // img 후보를 여러 개 찾고, 첫 번째 유효한 src를 사용
-    const imgs = scope.find("img").toArray();
-    for (const imgEl of imgs) {
-      const src = $(imgEl).attr("src") || $(imgEl).attr("data-src") || null;
-      const abs = absolutizeHafsUrl(src);
-      if (!abs || isBad(abs)) continue;
-      photoUrlCache.set(cacheKey, { url: abs, ts: Date.now() });
-      return abs;
     }
   }
 
@@ -709,10 +694,30 @@ app.post("/kakao", async (req, res) => {
       }
 
       const photos = [];
+      let photoTimedOut = false;
+      const withTimeout = async (promise, ms) => {
+        let t;
+        const timeout = new Promise((_, reject) => {
+          t = setTimeout(() => reject(new Error("PHOTO_TIMEOUT")), ms);
+        });
+        try {
+          return await Promise.race([promise, timeout]);
+        } finally {
+          clearTimeout(t);
+        }
+      };
 
       const addPhoto = async (koName) => {
-        const url = await fetchMealPhotoFromHafsSite(ymd, koName);
-        if (url) photos.push({ title: `(${pretty}) ${koName}`, imageUrl: url });
+        try {
+          const url = await withTimeout(fetchMealPhotoFromHafsSite(ymd, koName), 2800);
+          if (url) photos.push({ title: `(${pretty}) ${koName}`, imageUrl: url });
+        } catch (e) {
+          if (String(e?.message || "") === "PHOTO_TIMEOUT") {
+            photoTimedOut = true;
+          } else {
+            console.error("[photo fetch error]", e);
+          }
+        }
       };
 
       if (mealCode === "breakfast") await addPhoto("조식");
@@ -723,6 +728,15 @@ app.post("/kakao", async (req, res) => {
         await addPhoto("조식");
         await addPhoto("중식");
         await addPhoto("석식");
+      }
+
+      if (photos.length === 0 && photoTimedOut) {
+        return res.json(
+          kakaoText(
+            "사진 불러오기가 지연되고 있어요.\n서버가 잠깐 느린 것 같습니다. 10초 뒤에 다시 눌러주세요!",
+            null
+          )
+        );
       }
 
       return res.json(
