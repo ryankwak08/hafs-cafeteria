@@ -108,16 +108,30 @@ function hafsPageUrl(targetYmd) {
 async function fetchHafsHtml(targetYmd) {
   const cached = hafsHtmlCache.get(targetYmd);
   const now = Date.now();
-  if (cached && now - cached.ts < 5 * 60 * 1000) {
+  if (cached && now - cached.ts < 30 * 1000) {
     return cached.html;
   }
 
-  const url = hafsPageUrl(targetYmd);
-  const resp = await axios.get(url, {
+  // 학교 사이트/중간 캐시가 오래된 HTML을 주는 경우가 있어 cache-bust 파라미터를 붙인다.
+  const url = `${hafsPageUrl(targetYmd)}&v=${Date.now()}`;
+  const fetchOnce = (ms) => axios.get(url, {
     responseType: "arraybuffer",
-    headers: { "User-Agent": "Mozilla/5.0" },
-    timeout: 2500,
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache",
+    },
+    timeout: ms,
   });
+
+  let resp;
+  try {
+    // 1차: 빠르게
+    resp = await fetchOnce(3000);
+  } catch (e1) {
+    // 2차: 여유 있게 (로컬/학교 사이트가 느릴 때 대비)
+    resp = await fetchOnce(9000);
+  }
 
   let html = "";
   try {
