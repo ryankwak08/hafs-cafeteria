@@ -64,6 +64,10 @@ const hafsHtmlCache = new Map(); // ymd -> { html, ts }
 const photoUrlCache = new Map(); // key: `${ymd}|${mealKo}` -> { url: string|null, ts }
 const PHOTO_CACHE_TTL_MS = 30 * 60 * 1000; // 30분
 
+// ====== 석식(텍스트) 캐시: 카톡 타임아웃 방지용 ======
+const dinnerMenuCache = new Map(); // ymd -> { dinner: string|null, late: string|null, ts: number }
+const DINNER_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6시간
+
 // ====== 이미지 프록시 버퍼 캐시 (Kakao 이미지 로딩 안정화) ======
 const imgProxyCache = new Map(); // key: url -> { buf: Buffer, ct: string, ts: number }
 const IMG_CACHE_TTL_MS = 60 * 60 * 1000; // 1시간
@@ -98,6 +102,33 @@ function loadLastSelection(userId) {
     return null;
   }
   return v;
+}
+
+function saveDinnerCache(ymd, dinner, late) {
+  if (!ymd) return;
+  dinnerMenuCache.set(ymd, { dinner: dinner || null, late: late || null, ts: Date.now() });
+}
+
+function loadDinnerCache(ymd) {
+  const v = dinnerMenuCache.get(ymd);
+  if (!v) return null;
+  if (Date.now() - v.ts > DINNER_CACHE_TTL_MS) {
+    dinnerMenuCache.delete(ymd);
+    return null;
+  }
+  return v;
+}
+
+async function withTimeout(promise, ms, tag) {
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(tag || "TIMEOUT")), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 function hafsPageUrl(targetYmd) {
@@ -843,27 +874,43 @@ app.post("/kakao", async (req, res) => {
     // ====== 석식은 NEIS 업로드가 늦을 수 있어 학교 홈페이지에서 우선 시도 ======
     // (저녁 버튼은 기본적으로 오늘 석식 요청)
     if (meal === "dinner" && from === to) {
+      const pretty = `${from.slice(0, 4)}-${from.slice(4, 6)}-${from.slice(6, 8)}`;
+
+      // 0) 캐시가 있으면 즉시 응답 (카톡 멈춤 방지)
+      const cachedDinner = loadDinnerCache(from);
+      if (cachedDinner?.dinner) {
+        let combined = `🍽 석식\n📅 ${pretty}\n${cachedDinner.dinner}`;
+        if (cachedDinner.late) combined += `\n\n<야식>\n${cachedDinner.late}`;
+
+        saveLastSelection(userId, from, "dinner");
+        return res.json(kakaoText(combined, photoQuickReplies(from, "dinner")));
+      }
+
+      // 1) 새로 긁기: 2.8초 안에 끝내고, 아니면 "불러오는 중" 안내
       try {
-        const { dinner, late } = await fetchMealsFromHafsSite(from);
+        const { dinner, late } = await withTimeout(fetchMealsFromHafsSite(from), 2800, "DINNER_TIMEOUT");
         if (dinner) {
-          const pretty = `${from.slice(0, 4)}-${from.slice(4, 6)}-${from.slice(6, 8)}`;
+          saveDinnerCache(from, dinner, late);
 
           let combined = `🍽 석식\n📅 ${pretty}\n${dinner}`;
-
-          // 사이트에 <야식>이 실제로 포함되어 있으면 그대로 이어 붙임
-          if (late) {
-            combined += `\n\n<야식>\n${late}`;
-          }
+          if (late) combined += `\n\n<야식>\n${late}`;
 
           saveLastSelection(userId, from, "dinner");
-          return res.json(
-            kakaoText(combined, photoQuickReplies(from, "dinner"))
-          );
+          return res.json(kakaoText(combined, photoQuickReplies(from, "dinner")));
         }
       } catch (e) {
-        // 실패하면 NEIS로 폴백
-        console.error("[dinner scrape failed]", e);
+        if (String(e?.message || "") !== "DINNER_TIMEOUT") {
+          console.error("[dinner scrape failed]", e);
+        }
       }
+
+      // 2) 여기까지 왔으면: 사이트가 느리거나 아직 반영 전
+      return res.json(
+        kakaoText(
+          `🍽 석식\n📅 ${pretty}\n지금 석식 정보를 불러오는 중이에요.\n5초 뒤에 '저녁'을 한 번 더 눌러주세요!`,
+          null
+        )
+      );
     }
 
     const rows = await fetchMeals(from, to);
@@ -907,6 +954,7 @@ app.post("/kakao", async (req, res) => {
         const { day, result } = s;
         if (result?.dinner) {
           hafsDinnerMap.set(day, result);
+          saveDinnerCache(day, result.dinner, result.late);
         }
       }
     }
@@ -1039,6 +1087,50 @@ if (process.env.SELF_PING === "1" && process.env.NODE_ENV === "production") {
   setInterval(() => {
     axios.get(`${BASE_URL}/health`, { timeout: 2000 }).catch(() => {});
   }, 4 * 60 * 1000);
+}
+
+// ====== 캐시 워밍업: 석식/사진이 카톡에서 느리게 뜨는 문제 완화 ======
+// WARM_CACHE=1 로 켜면 4분마다 오늘 석식 텍스트 + 석식 사진(있으면)을 미리 캐시에 넣는다.
+if (process.env.WARM_CACHE === "1" && process.env.NODE_ENV === "production") {
+  const warm = async () => {
+    try {
+      const today = yyyymmdd(new Date());
+
+      // 1) 석식 텍스트 캐시
+      const { dinner, late } = await fetchMealsFromHafsSite(today);
+      if (dinner) saveDinnerCache(today, dinner, late);
+
+      // 2) 석식 사진 URL 캐시 + 이미지 버퍼 캐시
+      const photoUrl = await fetchMealPhotoFromHafsSite(today, "석식");
+      if (photoUrl) {
+        // /img 프록시 캐시에 직접 넣어두면 카톡에서 이미지 로딩이 빨라짐
+        const cached = imgProxyCache.get(photoUrl);
+        if (!cached) {
+          const resp = await axios.get(photoUrl, {
+            responseType: "arraybuffer",
+            headers: {
+              "User-Agent": "Mozilla/5.0",
+              "Referer": "https://hafs.hs.kr/",
+            },
+            timeout: 9000,
+          });
+          const rawCt = String(resp.headers["content-type"] || "").toLowerCase();
+          const ct = rawCt.startsWith("image/") ? rawCt : "image/jpeg";
+          const buf = Buffer.from(resp.data);
+          imgProxyCache.set(photoUrl, { buf, ct, ts: Date.now() });
+        }
+      }
+
+      console.log(`[warm] ok ${today}`);
+    } catch (e) {
+      console.log(`[warm] fail`, e?.message || e);
+    }
+  };
+
+  // 부팅 직후 1회
+  warm().catch(() => {});
+  // 이후 주기적으로
+  setInterval(() => warm().catch(() => {}), 4 * 60 * 1000);
 }
 
 // ====== 실행 ======
