@@ -860,43 +860,103 @@ app.post("/menu", (req, res) => {
 // Optional image proxy (kept for future photo features)
 app.get("/img", async (req, res) => {
   try {
-    const url = String(req.query.url || "");
-    if (!url || !/^https?:\/\//i.test(url)) return res.status(400).send("Bad url");
+    const raw = String(req.query.url || "");
+    if (!raw || !/^https?:\/\//i.test(raw)) return res.status(400).send("Bad url");
 
-    const u = new URL(url);
+    const u0 = new URL(raw);
     const allowedHosts = new Set(["hafs.hs.kr"]);
     if (HAFS_IP_FALLBACK) allowedHosts.add(HAFS_IP_FALLBACK);
-    if (!allowedHosts.has(u.hostname)) return res.status(403).send("Forbidden");
+    if (!allowedHosts.has(u0.hostname)) return res.status(403).send("Forbidden");
 
-    const isIpHost = HAFS_IP_FALLBACK && u.hostname === HAFS_IP_FALLBACK;
+    // 🔥 upstream은 HTTP를 우선 시도 (NitroEye가 https만 막는 경우가 많음)
+    const candidates = [];
+    const httpUrl = raw.replace(/^https:\/\//i, "http://");
+    const httpsUrl = raw.replace(/^http:\/\//i, "https://");
+    candidates.push(httpUrl, httpsUrl);
 
-    const resp = await axios.get(url, {
-      responseType: "arraybuffer",
-      httpsAgent: isIpHost ? httpsAgentHafsIp : httpsAgent,
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        Referer: "https://hafs.hs.kr/",
-        ...(isIpHost ? { Host: "hafs.hs.kr" } : {}),
-      },
-      timeout: 7000,
-      maxRedirects: 3,
-      validateStatus: (s) => s >= 200 && s < 400,
-    });
+    const isNitro = (resp, buf) => {
+      const loc = String(resp?.headers?.location || "");
+      if (loc.includes("nitroeye.co.kr/404_firewall")) return true;
+      const body = buf ? buf.toString("utf-8") : "";
+      return body.includes("nitroeye.co.kr/404_firewall") || body.includes("404_firewall");
+    };
 
-    const rawCt = String(resp.headers["content-type"] || "").toLowerCase();
-    const ct = rawCt.startsWith("image/") ? rawCt : "image/jpeg";
+    let lastErr = null;
 
-    const buf = Buffer.from(resp.data);
-    res.setHeader("Content-Type", ct);
-    res.setHeader("Content-Disposition", "inline");
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    return res.status(200).send(buf);
-  } catch {
+    // 1) axios로 빠르게 시도
+    for (const url of candidates) {
+      try {
+        const uu = new URL(url);
+        const isIpHost = HAFS_IP_FALLBACK && uu.hostname === HAFS_IP_FALLBACK;
+
+        const resp = await axios.get(url, {
+          responseType: "arraybuffer",
+          timeout: 7000,
+          maxRedirects: 0, // 리다이렉트 직접 감지
+          validateStatus: (s) => s >= 200 && s < 400,
+          httpsAgent: isIpHost ? httpsAgentHafsIp : httpsAgent,
+          httpAgent,
+          headers: {
+            "User-Agent": "Mozilla/5.0",
+            Referer: "https://hafs.hs.kr/",
+            ...(isIpHost ? { Host: "hafs.hs.kr" } : {}),
+          },
+        });
+
+        const buf = Buffer.from(resp.data || []);
+        if (isNitro(resp, buf)) throw Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
+
+        const ctRaw = String(resp.headers["content-type"] || "").toLowerCase();
+        if (!ctRaw.startsWith("image/")) throw new Error("NOT_IMAGE");
+
+        res.setHeader("Content-Type", ctRaw);
+        res.setHeader("Content-Disposition", "inline");
+        res.setHeader("Cache-Control", "public, max-age=3600");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.status(200).send(buf);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    // 2) axios가 막히면 Playwright로 “브라우저처럼” 받아오기 (이미지도 우회)
+    //    (playwright 설치되어 있어야 함)
+    try {
+      const htmlOrBinary = await fetchHtmlWithPlaywright(raw, 15000);
+      // ⚠️ playwright로는 여기서 "바이너리"를 직접 받기 어렵기 때문에
+      // 이미지 URL을 브라우저가 접근 가능하게끔 만든 다음, 다시 axios로 한 번 더 시도하는 방식이 가장 안정적
+      // (쿠키가 갱신되면 axios가 성공하는 케이스가 많음)
+
+      // 쿠키 갱신된 상태로 https 재시도
+      const retry = await axios.get(httpsUrl, {
+        responseType: "arraybuffer",
+        timeout: 7000,
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          Referer: "https://hafs.hs.kr/",
+          ...(HAFS_COOKIE ? { Cookie: HAFS_COOKIE } : {}),
+        },
+        validateStatus: (s) => s >= 200 && s < 400,
+      });
+
+      const ctRaw = String(retry.headers["content-type"] || "").toLowerCase();
+      const buf = Buffer.from(retry.data || []);
+      if (!ctRaw.startsWith("image/")) throw new Error("NOT_IMAGE_AFTER_PW");
+
+      res.setHeader("Content-Type", ctRaw);
+      res.setHeader("Content-Disposition", "inline");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(200).send(buf);
+    } catch (e) {
+      lastErr = e;
+    }
+
+    return res.status(404).send("Not found");
+  } catch (e) {
     return res.status(404).send("Not found");
   }
 });
-
 // Kakao webhook
 app.post("/kakao", async (req, res) => {
   try {
