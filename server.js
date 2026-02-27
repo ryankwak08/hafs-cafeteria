@@ -609,6 +609,10 @@ const MONTH_TTL_MS = 10 * 60 * 1000;
 const dayHtmlCache = new Map(); // key: YYYYMMDD -> { html, ts }
 const DAY_TTL_MS = 5 * 60 * 1000;
 
+// 이미지 캐시
+const imageBinCache = new Map();
+const IMAGE_TTL_MS = 60 * 60 * 1000;
+
 // In-flight de-dupe (prevents multiple concurrent fetches for the same key)
 const monthInFlight = new Map(); // key: YYYYMM -> Promise<html>
 const dayInFlight = new Map();   // key: YYYYMMDD -> Promise<html>
@@ -821,10 +825,25 @@ function extractPhotoLinksFromHtml(html) {
 }
 
 async function fetchMealPhotoUrl(ymd, mealKey) {
+  const key = `${ymd}|${mealKey}`;
+  const cached = photoUrlCache.get(key);
+  const now = Date.now();
+
+  if (cached && now - cached.ts < PHOTO_URL_TTL_MS) {
+    return cached.url || null;
+  }
+
   const html = await fetchDayInfo(ymd);
   const map = extractPhotoLinksFromHtml(html);
-  return map?.[mealKey] || null;
+  const url = map?.[mealKey] || null;
+
+  if (url) photoUrlCache.set(key, { url, ts: now });
+
+  return url;
 }
+
+const photoUrlCache = new Map();
+const PHOTO_URL_TTL_MS = 30 * 60 * 1000;
 
 function proxiedImageUrl(rawUrl) {
   if (!rawUrl) return null;
@@ -904,6 +923,8 @@ app.get("/img", async (req, res) => {
         });
 
         const buf = Buffer.from(resp.data || []);
+        // 이미지 캐시
+        imageBinCache.set(url, { buf, ct: resp.headers["content-type"]    , ts: Date.now() });
         if (isNitro(resp, buf)) throw Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
 
         const ctRaw = String(resp.headers["content-type"] || "").toLowerCase();
@@ -947,6 +968,7 @@ app.get("/img", async (req, res) => {
       res.setHeader("Content-Disposition", "inline");
       res.setHeader("Cache-Control", "public, max-age=3600");
       res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Length", String(buf.length)); // ⭐ 이게 핵심
       return res.status(200).send(buf);
     } catch (e) {
       lastErr = e;
