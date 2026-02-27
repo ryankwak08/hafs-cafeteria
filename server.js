@@ -84,6 +84,7 @@ function kakaoImageCard(titleText, imageUrl, altText, quickReplies = null) {
 function photoQuickReplies(ymd, mealKey) {
   return [
     { label: "식단 사진 보기", action: "message", messageText: `사진|${ymd}|${mealKey}` },
+    ...menuQuickReplies(),
   ];
 }
 
@@ -307,23 +308,110 @@ function toIpUrl(originalUrl) {
 }
 
 async function getHtmlArrayBuffer(url, timeoutMs = 7000) {
-  // 🚨 Force real browser fetch ONLY (disable axios completely)
-  // NitroEye is blocking all non-browser traffic.
-  // We now ALWAYS use Playwright.
+  // Fast path: try plain HTTP/HTTPS with axios first (much faster than Playwright).
+  // Fallback to Playwright ONLY when NitroEye blocks (302 to nitroeye / firewall body).
 
-  const html = await fetchHtmlWithPlaywright(url, Math.max(15000, timeoutMs));
+  const headers = buildBrowserHeaders();
 
-  if (!html) {
-    const err = new Error("HAFS_FIREWALL_BLOCK");
-    err.code = "HAFS_FIREWALL";
-    throw err;
+  // Try both schemes (many environments: HTTPS -> NitroEye 302, HTTP often works)
+  const httpsUrl = String(url).replace(/^http:\/\//i, "https://");
+  const httpUrl = String(url).replace(/^https:\/\//i, "http://");
+  const candidates = [httpUrl, httpsUrl];
+
+  const tryAxios = async (u) => {
+    // Some environments have DNS issues; allow IP fallback.
+    const ipUrl = toIpUrl(u);
+    const useIp = HAFS_IP_FALLBACK && ipUrl !== u;
+
+    const resp = await axios.get(ipUrl, {
+      responseType: "arraybuffer",
+      timeout: Math.min(Math.max(timeoutMs, 2500), 6000),
+      // Important: do NOT auto-follow redirects; we want to detect NitroEye quickly.
+      maxRedirects: 0,
+      validateStatus: (s) => (s >= 200 && s < 300) || (s >= 300 && s < 400),
+      headers: {
+        ...headers,
+        // When using IP, preserve SNI+Host for TLS cert / virtual host routing.
+        ...(useIp ? { Host: HAFS_HOST } : {}),
+      },
+      // Use agents (IPv4 first)
+      httpAgent,
+      httpsAgent: useIp ? httpsAgentHafsIp : httpsAgent,
+    });
+
+    updateCookieFromResponse(resp);
+
+    // If redirecting to NitroEye, treat as firewall.
+    if (isRedirect(resp) && isFirewall(resp)) {
+      const err = new Error("HAFS_FIREWALL_BLOCK");
+      err.code = "HAFS_FIREWALL";
+      throw err;
+    }
+
+    // If a redirect happens, follow it once manually (still faster than Playwright).
+    if (isRedirect(resp)) {
+      const loc = String(resp.headers?.location || "");
+      const nextUrl = resolveRedirectUrl(u, loc);
+      if (loc.includes("nitroeye.co.kr/404_firewall")) {
+        const err = new Error("HAFS_FIREWALL_BLOCK");
+        err.code = "HAFS_FIREWALL";
+        throw err;
+      }
+      const resp2 = await axios.get(toIpUrl(nextUrl), {
+        responseType: "arraybuffer",
+        timeout: Math.min(Math.max(timeoutMs, 2500), 6000),
+        maxRedirects: 0,
+        validateStatus: (s) => (s >= 200 && s < 300) || (s >= 300 && s < 400),
+        headers: {
+          ...headers,
+          ...(HAFS_IP_FALLBACK && toIpUrl(nextUrl) !== nextUrl ? { Host: HAFS_HOST } : {}),
+        },
+        httpAgent,
+        httpsAgent: (HAFS_IP_FALLBACK && toIpUrl(nextUrl) !== nextUrl) ? httpsAgentHafsIp : httpsAgent,
+      });
+      updateCookieFromResponse(resp2);
+      if (isRedirect(resp2) && isFirewall(resp2)) {
+        const err = new Error("HAFS_FIREWALL_BLOCK");
+        err.code = "HAFS_FIREWALL";
+        throw err;
+      }
+      return resp2;
+    }
+
+    // Some blocks return 200 with firewall HTML.
+    if (isFirewall(resp)) {
+      const err = new Error("HAFS_FIREWALL_BLOCK");
+      err.code = "HAFS_FIREWALL";
+      throw err;
+    }
+
+    return resp;
+  };
+
+  let lastErr = null;
+  for (const u of candidates) {
+    try {
+      return await tryAxios(u);
+    } catch (e) {
+      lastErr = e;
+      // If it wasn't a firewall error, continue to next scheme.
+      continue;
+    }
   }
 
-  return {
-    status: 200,
-    headers: { "content-type": "text/html" },
-    data: iconv.encode(html, "euc-kr"),
-  };
+  // Slow fallback: real browser fetch.
+  // Keep this timeout tight so Kakao doesn't hang too long.
+  try {
+    const html = await fetchHtmlWithPlaywright(url, 9000);
+    return {
+      status: 200,
+      headers: { "content-type": "text/html" },
+      data: iconv.encode(html, "euc-kr"),
+    };
+  } catch (e) {
+    // Prefer original firewall code if present
+    throw lastErr || e;
+  }
 }
 
 function decodeHafsHtml(arrayBuffer) {
@@ -521,16 +609,31 @@ const MONTH_TTL_MS = 10 * 60 * 1000;
 const dayHtmlCache = new Map(); // key: YYYYMMDD -> { html, ts }
 const DAY_TTL_MS = 5 * 60 * 1000;
 
+// In-flight de-dupe (prevents multiple concurrent fetches for the same key)
+const monthInFlight = new Map(); // key: YYYYMM -> Promise<html>
+const dayInFlight = new Map();   // key: YYYYMMDD -> Promise<html>
+
 async function fetchDayInfo(ymd) {
   const cached = dayHtmlCache.get(ymd);
   const now = Date.now();
   if (cached && now - cached.ts < DAY_TTL_MS) return cached.html;
 
-  const url = hafsDayUrl(ymd);
-  const resp = await getHtmlArrayBuffer(url, 12000);
-  const html = decodeHafsHtml(resp.data);
-  dayHtmlCache.set(ymd, { html, ts: now });
-  return html;
+  if (dayInFlight.has(ymd)) return await dayInFlight.get(ymd);
+
+  const p = (async () => {
+    const url = hafsDayUrl(ymd);
+    const resp = await getHtmlArrayBuffer(url, 6000);
+    const html = decodeHafsHtml(resp.data);
+    dayHtmlCache.set(ymd, { html, ts: Date.now() });
+    return html;
+  })();
+
+  dayInFlight.set(ymd, p);
+  try {
+    return await p;
+  } finally {
+    dayInFlight.delete(ymd);
+  }
 }
 
 async function fetchDayMeals(ymd) {
@@ -562,9 +665,23 @@ async function fetchMonthMapForRange(fromYmd, toYmd) {
     } else {
       const anyDay = `${y}${pad2(m)}01`;
       const url = hafsMonthUrl(anyDay);
-      const resp = await getHtmlArrayBuffer(url, 9000);
-      html = decodeHafsHtml(resp.data);
-      monthHtmlCache.set(cacheKey, { html, ts: now });
+
+      if (monthInFlight.has(cacheKey)) {
+        html = await monthInFlight.get(cacheKey);
+      } else {
+        const p = (async () => {
+          const resp = await getHtmlArrayBuffer(url, 6000);
+          return decodeHafsHtml(resp.data);
+        })();
+        monthInFlight.set(cacheKey, p);
+        try {
+          html = await p;
+        } finally {
+          monthInFlight.delete(cacheKey);
+        }
+      }
+
+      monthHtmlCache.set(cacheKey, { html, ts: Date.now() });
     }
 
     maps.push(parseMonthMeals(html, y, m));
@@ -848,7 +965,10 @@ app.post("/kakao", async (req, res) => {
 
     // single meal
     if (meal !== "all" && from === to) {
-      const info = rangeMap.get(from) || {};
+      // Fast path for single-meal buttons: fetch just the day page and parse it.
+      // This is much faster than month-range parsing under load.
+      const infoFast = await fetchDayMeals(from);
+      const info = infoFast || {};
       let menuText = null;
       let lateText = null;
 
@@ -861,7 +981,7 @@ app.post("/kakao", async (req, res) => {
 
       if (!menuText) {
         return res.json(
-          kakaoText(`🍽 ${mealKo(meal)} 정보가 아직 등록되지 않았거나 오늘은 제공되지 않습니다.`, null)
+          kakaoText(`🍽 ${mealKo(meal)} 정보가 아직 등록되지 않았거나 오늘은 제공되지 않습니다.`, menuQuickReplies())
         );
       }
 
@@ -889,7 +1009,7 @@ app.post("/kakao", async (req, res) => {
       })
       .join("\n\n──────────\n\n");
 
-    return res.json(kakaoText(text, null));
+    return res.json(kakaoText(text, menuQuickReplies()));
   } catch (err) {
     const code = err?.code || "";
     const msg = err?.message || "";
