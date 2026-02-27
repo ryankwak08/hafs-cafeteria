@@ -49,13 +49,11 @@ const BASE_URL = process.env.BASE_URL || "https://hafs-cafeteria.onrender.com";
 
 // ----------------- Kakao UI helpers -----------------
 function menuQuickReplies() {
+  // Only keep meal buttons. (오늘/내일/이번주 buttons removed)
   return [
     { label: "아침", action: "message", messageText: "아침" },
     { label: "점심", action: "message", messageText: "점심" },
     { label: "저녁", action: "message", messageText: "저녁" },
-    { label: "오늘", action: "message", messageText: "오늘" },
-    { label: "내일", action: "message", messageText: "내일" },
-    { label: "이번주", action: "message", messageText: "이번주" },
   ];
 }
 
@@ -83,8 +81,11 @@ function kakaoImageCard(titleText, imageUrl, altText, quickReplies = null) {
 
 function photoQuickReplies(ymd, mealKey) {
   return [
-    { label: "식단 사진 보기", action: "message", messageText: `사진|${ymd}|${mealKey}` },
-    ...menuQuickReplies(),
+    // 카톡에서 label 텍스트가 그대로 발화로 들어오는 경우가 있어서 이 텍스트를 지원할 거야
+    { label: "식단 사진 보기", action: "message", messageText: "식단 사진 보기" },
+    { label: "아침", action: "message", messageText: "아침" },
+    { label: "점심", action: "message", messageText: "점심" },
+    { label: "저녁", action: "message", messageText: "저녁" },
   ];
 }
 
@@ -741,6 +742,10 @@ async function fetchMonthMapForRange(fromYmd, toYmd) {
 function parseUtter(utterRaw) {
   const utter = (utterRaw || "").trim();
 
+  if (utter === "식단 사진 보기") {
+    return { utter, when: "today", meal: "photo_from_ctx" };
+  }
+
   // Photo request: "사진|YYYYMMDD|breakfast|lunch|dinner"
   if (utter.startsWith("사진|")) {
     const parts = utter.split("|");
@@ -844,6 +849,34 @@ async function fetchMealPhotoUrl(ymd, mealKey) {
 
 const photoUrlCache = new Map();
 const PHOTO_URL_TTL_MS = 30 * 60 * 1000;
+
+// Last meal context per Kakao user (to support "식단 사진 보기" as plain utterance)
+const lastMealCtx = new Map(); // key: userId -> { ymd, mealKey, ts }
+const LAST_CTX_TTL_MS = 30 * 60 * 1000;
+
+function getUserId(req) {
+  return (
+    req?.body?.userRequest?.user?.id ||
+    req?.body?.userRequest?.user?.properties?.appUserId ||
+    ""
+  );
+}
+
+function setLastMealCtx(userId, ymd, mealKey) {
+  if (!userId) return;
+  lastMealCtx.set(userId, { ymd, mealKey, ts: Date.now() });
+}
+
+function getLastMealCtx(userId) {
+  if (!userId) return null;
+  const v = lastMealCtx.get(userId);
+  if (!v) return null;
+  if (Date.now() - v.ts > LAST_CTX_TTL_MS) {
+    lastMealCtx.delete(userId);
+    return null;
+  }
+  return v;
+}
 
 function proxiedImageUrl(rawUrl) {
   if (!rawUrl) return null;
@@ -1003,14 +1036,44 @@ app.post("/kakao", async (req, res) => {
       );
     }
 
-    // Menu for empty or unknown
-    if (!utter || !["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주"].some((k) => utter.includes(k))) {
+        // Photo flow (from stored context)
+    if (parsed.meal === "photo_from_ctx") {
+      const userId = getUserId(req);
+      const ctx = getLastMealCtx(userId);
+
+      if (!ctx) {
+        return res.json(kakaoText("먼저 아침/점심/저녁 메뉴를 확인한 뒤, 식단 사진 보기를 눌러줘!", null));
+      }
+
+      const ymd = ctx.ymd;
+      const mealKey = ctx.mealKey;
+      const titleKo = mealKo(mealKey);
+
+      const rawPhotoUrl = await fetchMealPhotoUrl(ymd, mealKey);
+      if (!rawPhotoUrl) {
+        return res.json(kakaoText("식단 사진이 없습니다.", null));
+      }
+
+      const imgUrl = proxiedImageUrl(rawPhotoUrl);
       return res.json(
-        kakaoText(
-          "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사\n• 오늘/내일/이번주: 전체 식단"
-        )
+        kakaoImageCard(`📷 (${prettyYmd(ymd)}) ${titleKo}`, imgUrl, `(${prettyYmd(ymd)}) ${titleKo}`, null)
       );
     }
+
+    // Menu for empty or unknown
+    if (
+  !utter ||
+  !["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주", "식단 사진 보기", "사진|"].some((k) =>
+    utter.includes(k)
+  )
+) {
+  return res.json(
+    kakaoText(
+      "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사\n• 오늘/내일/이번주: 전체 식단",
+      menuQuickReplies()
+    )
+  );
+}
 
     const now = new Date();
     let from, to;
@@ -1051,6 +1114,8 @@ app.post("/kakao", async (req, res) => {
       // This is much faster than month-range parsing under load.
       const infoFast = await fetchDayMeals(from);
       const info = infoFast || {};
+      const userId = getUserId(req);
+      setLastMealCtx(userId, from, meal);
       let menuText = null;
       let lateText = null;
 
@@ -1091,7 +1156,7 @@ app.post("/kakao", async (req, res) => {
       })
       .join("\n\n──────────\n\n");
 
-    return res.json(kakaoText(text, menuQuickReplies()));
+    return res.json(kakaoText(text, null));
   } catch (err) {
     const code = err?.code || "";
     const msg = err?.message || "";
