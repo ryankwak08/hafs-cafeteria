@@ -79,9 +79,6 @@ function kakaoImageCard(titleText, imageUrl, altText, quickReplies = null) {
   return { version: "2.0", template: tpl };
 }
 
-function photoQuickReplies() {
-  return [{ label: "식단 사진 보기", action: "message", messageText: "식단 사진 보기" }];
-}
 
 // ----------------- Date utils -----------------
 function pad2(n) {
@@ -736,10 +733,6 @@ async function fetchMonthMapForRange(fromYmd, toYmd) {
 function parseUtter(utterRaw) {
   const utter = (utterRaw || "").trim();
 
-  if (utter === "식단 사진 보기") {
-    return { utter, when: "today", meal: "photo_from_ctx" };
-  }
-
   // Photo request: "사진|YYYYMMDD|breakfast|lunch|dinner"
   if (utter.startsWith("사진|")) {
     const parts = utter.split("|");
@@ -906,33 +899,6 @@ async function fetchMealPhotoUrl(ymd, mealKey) {
 const photoUrlCache = new Map();
 const PHOTO_URL_TTL_MS = 30 * 60 * 1000;
 
-// Last meal context per Kakao user (to support "식단 사진 보기" as plain utterance)
-const lastMealCtx = new Map(); // userId -> { ymd, mealKey, photoUrl, ts }
-
-function setLastMealCtx(userId, ymd, mealKey, photoUrl = null) {
-  if (!userId) return;
-  lastMealCtx.set(userId, { ymd, mealKey, photoUrl: photoUrl || null, ts: Date.now() });
-}
-const LAST_CTX_TTL_MS = 30 * 60 * 1000;
-
-function getUserId(req) {
-  return (
-    req?.body?.userRequest?.user?.id ||
-    req?.body?.userRequest?.user?.properties?.appUserId ||
-    ""
-  );
-}
-
-function getLastMealCtx(userId) {
-  if (!userId) return null;
-  const v = lastMealCtx.get(userId);
-  if (!v) return null;
-  if (Date.now() - v.ts > LAST_CTX_TTL_MS) {
-    lastMealCtx.delete(userId);
-    return null;
-  }
-  return v;
-}
 
 function proxiedImageUrl(rawUrl) {
   if (!rawUrl) return null;
@@ -959,7 +925,7 @@ app.get("/health", (req, res) => {
 app.post("/menu", (req, res) => {
   return res.json(
     kakaoText(
-      "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사\n• 오늘/내일/이번주: 전체 식단",
+      "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사(사진 있으면 같이 표시)\n• 오늘/내일/이번주: 전체 식단",
       menuQuickReplies()
     )
   );
@@ -968,13 +934,23 @@ app.post("/menu", (req, res) => {
 // Optional image proxy (kept for future photo features)
 app.get("/img", async (req, res) => {
   try {
-    const raw = String(req.query.url || "");
+    let raw = String(req.query.url || "");
     if (!raw || !/^https?:\/\//i.test(raw)) return res.status(400).send("Bad url");
+
+    // Normalize common variants so the allowlist check doesn't falsely reject.
+    // NOTE: do NOT use www.* for upstream fetch because of TLS SAN mismatch on the school cert.
+    raw = raw
+      .replace(/^https:\/\/www\.hafs\.hs\.kr/i, "https://hafs.hs.kr")
+      .replace(/^http:\/\/www\.hafs\.hs\.kr/i, "http://hafs.hs.kr");
 
     const u0 = new URL(raw);
     const allowedHosts = new Set(["hafs.hs.kr"]);
     if (HAFS_IP_FALLBACK) allowedHosts.add(HAFS_IP_FALLBACK);
-    if (!allowedHosts.has(u0.hostname)) return res.status(403).send("Forbidden");
+    if (!allowedHosts.has(u0.hostname)) {
+      // Helpful debug for local testing
+      console.error("[img] forbidden host", { host: u0.hostname, raw });
+      return res.status(403).send("Forbidden");
+    }
 
     // 🔥 upstream은 HTTP를 우선 시도 (NitroEye가 https만 막는 경우가 많음)
     const candidates = [];
@@ -1075,88 +1051,18 @@ app.post("/kakao", async (req, res) => {
     const utter = req?.body?.userRequest?.utterance || "";
     const { when, meal } = parseUtter(utter);
 
-    // Photo flow
-    const parsed = parseUtter(utter);
-
-    // 1) Explicit photo request: "사진|YYYYMMDD|breakfast|lunch|dinner"
-    if (parsed.meal === "photo") {
-      const ymd = parsed.photoYmd;
-      const mealKey = parsed.photoMeal;
-      const userId = getUserId(req);
-
-      // Try to fetch a fresh photo URL for that date/meal
-      const rawPhotoUrl = await fetchMealPhotoUrl(ymd, mealKey);
-
-      // Cache context (positive or negative)
-      setLastMealCtx(userId, ymd, mealKey, rawPhotoUrl || null);
-
-      if (!rawPhotoUrl) {
-        return res.json(kakaoText("식단 사진이 없습니다.", null));
-      }
-
-      const imgUrl = proxiedImageUrl(rawPhotoUrl);
-      return res.json(
-        kakaoImageCard(
-          `📷 (${prettyYmd(ymd)}) ${mealKo(mealKey)}`,
-          imgUrl,
-          `(${prettyYmd(ymd)}) ${mealKo(mealKey)}`,
-          null
-        )
-      );
-    }
-
-    // 2) Button-based photo request: "식단 사진 보기" uses stored context from the last meal view
-    if (parsed.meal === "photo_from_ctx") {
-      const userId = getUserId(req);
-      const ctx = getLastMealCtx(userId);
-
-      if (!ctx) {
-        return res.json(kakaoText("먼저 아침/점심/저녁 메뉴를 확인한 뒤, 식단 사진 보기를 눌러줘!", null));
-      }
-
-      // ✅ If we already know there is no photo, respond immediately (no network)
-      if (ctx.photoUrl === null) {
-        return res.json(kakaoText("식단 사진이 없습니다.", null));
-      }
-
-      // ✅ If we already cached the photo URL from the meal view, respond immediately (no network)
-      let rawPhotoUrl = ctx.photoUrl;
-      if (!rawPhotoUrl) {
-        // Only then hit the network
-        rawPhotoUrl = await fetchMealPhotoUrl(ctx.ymd, ctx.mealKey);
-        // Cache the result (positive or negative) so repeated clicks are instant
-        setLastMealCtx(userId, ctx.ymd, ctx.mealKey, rawPhotoUrl || null);
-      }
-
-      if (!rawPhotoUrl) {
-        return res.json(kakaoText("식단 사진이 없습니다.", null));
-      }
-
-      const imgUrl = proxiedImageUrl(rawPhotoUrl);
-      return res.json(
-        kakaoImageCard(
-          `📷 (${prettyYmd(ctx.ymd)}) ${mealKo(ctx.mealKey)}`,
-          imgUrl,
-          `(${prettyYmd(ctx.ymd)}) ${mealKo(ctx.mealKey)}`,
-          null
-        )
-      );
-    }
-
     // Menu for empty or unknown
     if (
-  !utter ||
-  !["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주", "식단 사진 보기", "사진|"].some((k) =>
-    utter.includes(k)
-  )
-) {
-  return res.json(
-    kakaoText(
-      "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사\n• 오늘/내일/이번주: 전체 식단",
-      menuQuickReplies()
-    )
-  );
-}
+      !utter ||
+      !["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주"].some((k) => utter.includes(k))
+    ) {
+      return res.json(
+        kakaoText(
+          "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사(사진 있으면 같이 표시)\n• 오늘/내일/이번주: 전체 식단",
+          menuQuickReplies()
+        )
+      );
+    }
 
     const now = new Date();
     let from, to;
@@ -1199,9 +1105,7 @@ app.post("/kakao", async (req, res) => {
       const info = parseDayMealsFromPageHtml(dayHtml) || {};
       const photoLinks = extractPhotoLinksFromHtml(dayHtml) || { breakfast: null, lunch: null, dinner: null };
 
-      const userId = getUserId(req);
       const rawPhotoUrlForMeal = photoLinks?.[meal] || null;
-      setLastMealCtx(userId, from, meal, rawPhotoUrlForMeal);
 
       // Build menu text for the requested meal
       let menuText = null;
@@ -1225,9 +1129,20 @@ app.post("/kakao", async (req, res) => {
 
       const text = `🍽 ${mealKo(meal)}\n📅 ${prettyYmd(from)}\n${menuText}`;
 
-      // ✅ Photo button only when photo exists; otherwise no buttons
-      const qr = rawPhotoUrlForMeal ? photoQuickReplies() : null;
-      return res.json(kakaoText(text, qr));
+      // ✅ If a photo exists, show it together with the menu (no separate button)
+      if (rawPhotoUrlForMeal) {
+        const imgUrl = proxiedImageUrl(rawPhotoUrlForMeal);
+        return res.json(
+          kakaoImageCard(
+            text,
+            imgUrl,
+            `(${prettyYmd(from)}) ${mealKo(meal)}`,
+            null
+          )
+        );
+      }
+
+      return res.json(kakaoText(text, null));
     }
 
     // all
