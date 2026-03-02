@@ -4,6 +4,14 @@ import * as cheerio from "cheerio";
 import iconv from "iconv-lite";
 import https from "https";
 import http from "http";
+// Optional (recommended) for Kakao: resize/compress images so Kakao can fetch reliably
+let sharp = null;
+try {
+  const mod = await import("sharp");
+  sharp = mod.default || mod;
+} catch {
+  sharp = null;
+}
 
 // Playwright is optional (used to bypass NitroEye blocks when curl/axios gets 302 to nitroeye)
 let chromium = null;
@@ -931,38 +939,102 @@ app.post("/menu", (req, res) => {
   );
 });
 
-// Optional image proxy (kept for future photo features)
+// Optional image proxy (used by photo features)
+// Kakao fetches the image from imageUrl server-side. If the file is too large/slow, Kakao may time out.
+// So we: (1) cache, (2) prefer HTTP upstream, (3) compress/resize when large.
 app.get("/img", async (req, res) => {
   try {
-    let raw = String(req.query.url || "");
+    const raw = String(req.query.url || "");
+    console.log("[IMG HIT]", {
+      time: new Date().toISOString(),
+      raw,
+      ua: req.headers["user-agent"] || "",
+      ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
+    });
     if (!raw || !/^https?:\/\//i.test(raw)) return res.status(400).send("Bad url");
-
-    // Normalize common variants so the allowlist check doesn't falsely reject.
-    // NOTE: do NOT use www.* for upstream fetch because of TLS SAN mismatch on the school cert.
-    raw = raw
-      .replace(/^https:\/\/www\.hafs\.hs\.kr/i, "https://hafs.hs.kr")
-      .replace(/^http:\/\/www\.hafs\.hs\.kr/i, "http://hafs.hs.kr");
 
     const u0 = new URL(raw);
     const allowedHosts = new Set(["hafs.hs.kr"]);
     if (HAFS_IP_FALLBACK) allowedHosts.add(HAFS_IP_FALLBACK);
-    if (!allowedHosts.has(u0.hostname)) {
-      // Helpful debug for local testing
-      console.error("[img] forbidden host", { host: u0.hostname, raw });
-      return res.status(403).send("Forbidden");
+    if (!allowedHosts.has(u0.hostname)) return res.status(403).send("Forbidden");
+
+    // Normalize cache key (keep original + normalized schemes)
+    const httpRaw = raw.replace(/^https:\/\//i, "http://");
+    const httpsRaw = raw.replace(/^http:\/\//i, "https://");
+
+    const now = Date.now();
+    const pickCached = (key) => {
+      const c = imageBinCache.get(key);
+      if (!c) return null;
+      if (now - (c.ts || 0) > IMAGE_TTL_MS) {
+        imageBinCache.delete(key);
+        return null;
+      }
+      return c;
+    };
+
+    // Serve from cache immediately if possible
+    const cached = pickCached(raw) || pickCached(httpRaw) || pickCached(httpsRaw);
+    if (cached && cached.buf && cached.ct) {
+      res.setHeader("Content-Type", cached.ct);
+      res.setHeader("Content-Disposition", "inline");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Length", String(cached.buf.length));
+      return res.status(200).send(cached.buf);
     }
 
     // 🔥 upstream은 HTTP를 우선 시도 (NitroEye가 https만 막는 경우가 많음)
-    const candidates = [];
-    const httpUrl = raw.replace(/^https:\/\//i, "http://");
-    const httpsUrl = raw.replace(/^http:\/\//i, "https://");
-    candidates.push(httpUrl, httpsUrl);
+    const candidates = [httpRaw, httpsRaw];
 
     const isNitro = (resp, buf) => {
       const loc = String(resp?.headers?.location || "");
       if (loc.includes("nitroeye.co.kr/404_firewall")) return true;
       const body = buf ? buf.toString("utf-8") : "";
       return body.includes("nitroeye.co.kr/404_firewall") || body.includes("404_firewall");
+    };
+
+    const sendBuf = (buf, ct) => {
+      console.log("[IMG RESP]", {
+        bytes: buf?.length || 0,
+        contentType: ct,
+      });
+      res.setHeader("Content-Type", ct);
+      res.setHeader("Content-Disposition", "inline");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Length", String(buf.length));
+      return res.status(200).send(buf);
+    };
+
+    // Compress helper (Kakao is much more reliable when images are <= ~1-2MB)
+    const maybeCompress = async (buf, ct) => {
+      // Only compress if Sharp is available and the payload is large
+      const MAX_BYTES = 1_200_000; // ~1.2MB target
+      if (!sharp) return { buf, ct };
+      if (!buf || buf.length <= MAX_BYTES) return { buf, ct };
+
+      const ctLower = String(ct || "").toLowerCase();
+      const looksLikeImage = ctLower.startsWith("image/");
+      if (!looksLikeImage) return { buf, ct };
+
+      // Convert everything to jpeg for predictable size
+      // Resize to max width 1024 (keep aspect)
+      try {
+        const out = await sharp(buf)
+          .rotate() // respect EXIF orientation
+          .resize({ width: 1024, withoutEnlargement: true })
+          .jpeg({ quality: 70, mozjpeg: true })
+          .toBuffer();
+
+        // If compression somehow got bigger, keep original
+        if (out && out.length > 0 && out.length < buf.length) {
+          return { buf: out, ct: "image/jpeg" };
+        }
+      } catch {
+        // ignore compression errors
+      }
+      return { buf, ct };
     };
 
     let lastErr = null;
@@ -976,7 +1048,7 @@ app.get("/img", async (req, res) => {
         const resp = await axios.get(url, {
           responseType: "arraybuffer",
           timeout: 7000,
-          maxRedirects: 0, // 리다이렉트 직접 감지
+          maxRedirects: 0,
           validateStatus: (s) => s >= 200 && s < 400,
           httpsAgent: isIpHost ? httpsAgentHafsIp : httpsAgent,
           httpAgent,
@@ -984,64 +1056,72 @@ app.get("/img", async (req, res) => {
             "User-Agent": "Mozilla/5.0",
             Referer: "https://hafs.hs.kr/",
             ...(isIpHost ? { Host: "hafs.hs.kr" } : {}),
+            ...(HAFS_COOKIE ? { Cookie: HAFS_COOKIE } : {}),
           },
         });
 
-        const buf = Buffer.from(resp.data || []);
-        // 이미지 캐시
-        imageBinCache.set(url, { buf, ct: resp.headers["content-type"]    , ts: Date.now() });
-        if (isNitro(resp, buf)) throw Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
-
         const ctRaw = String(resp.headers["content-type"] || "").toLowerCase();
+        const buf0 = Buffer.from(resp.data || []);
+
+        if (isNitro(resp, buf0)) throw Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
         if (!ctRaw.startsWith("image/")) throw new Error("NOT_IMAGE");
 
-        res.setHeader("Content-Type", ctRaw);
-        res.setHeader("Content-Disposition", "inline");
-        res.setHeader("Cache-Control", "public, max-age=3600");
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        res.setHeader("Content-Length", String(buf.length));
-        return res.status(200).send(buf);
+        // Compress if needed
+        const { buf, ct } = await maybeCompress(buf0, ctRaw);
+
+        // Cache the FINAL payload we send to Kakao
+        imageBinCache.set(raw, { buf, ct, ts: Date.now() });
+        imageBinCache.set(url, { buf, ct, ts: Date.now() });
+
+        return sendBuf(buf, ct);
       } catch (e) {
         lastErr = e;
       }
     }
 
-    // 2) axios가 막히면 Playwright로 “브라우저처럼” 받아오기 (이미지도 우회)
-    //    (playwright 설치되어 있어야 함)
+    // 2) axios가 막히면 Playwright로 쿠키/세션 우회 → axios 재시도
     try {
-      const htmlOrBinary = await fetchHtmlWithPlaywright(raw, 15000);
-      // ⚠️ playwright로는 여기서 "바이너리"를 직접 받기 어렵기 때문에
-      // 이미지 URL을 브라우저가 접근 가능하게끔 만든 다음, 다시 axios로 한 번 더 시도하는 방식이 가장 안정적
-      // (쿠키가 갱신되면 axios가 성공하는 케이스가 많음)
+      await fetchHtmlWithPlaywright(raw, 12000);
 
-      // 쿠키 갱신된 상태로 https 재시도
-      const retry = await axios.get(httpsUrl, {
+      // 쿠키 갱신된 상태로 재시도 (https 우선)
+      const retryUrl = httpsRaw;
+      const resp = await axios.get(retryUrl, {
         responseType: "arraybuffer",
         timeout: 7000,
+        maxRedirects: 0,
+        validateStatus: (s) => s >= 200 && s < 400,
         headers: {
           "User-Agent": "Mozilla/5.0",
           Referer: "https://hafs.hs.kr/",
           ...(HAFS_COOKIE ? { Cookie: HAFS_COOKIE } : {}),
         },
-        validateStatus: (s) => s >= 200 && s < 400,
       });
 
-      const ctRaw = String(retry.headers["content-type"] || "").toLowerCase();
-      const buf = Buffer.from(retry.data || []);
+      const ctRaw = String(resp.headers["content-type"] || "").toLowerCase();
+      const buf0 = Buffer.from(resp.data || []);
+      if (isNitro(resp, buf0)) throw Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
       if (!ctRaw.startsWith("image/")) throw new Error("NOT_IMAGE_AFTER_PW");
 
-      res.setHeader("Content-Type", ctRaw);
-      res.setHeader("Content-Disposition", "inline");
-      res.setHeader("Cache-Control", "public, max-age=3600");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Content-Length", String(buf.length)); // ⭐ 이게 핵심
-      return res.status(200).send(buf);
+      const { buf, ct } = await maybeCompress(buf0, ctRaw);
+
+      imageBinCache.set(raw, { buf, ct, ts: Date.now() });
+      imageBinCache.set(httpsRaw, { buf, ct, ts: Date.now() });
+      imageBinCache.set(httpRaw, { buf, ct, ts: Date.now() });
+
+      return sendBuf(buf, ct);
     } catch (e) {
       lastErr = e;
     }
 
+    // If we got here, nothing worked
+    if (lastErr?.code === "HAFS_FIREWALL") {
+      console.error("[IMG ERROR] HAFS_FIREWALL", lastErr?.message || lastErr);
+      return res.status(503).send("HAFS_FIREWALL");
+    }
+    console.error("[IMG ERROR] Not found", lastErr?.message || lastErr);
     return res.status(404).send("Not found");
-  } catch (e) {
+  } catch (err) {
+    console.error("[IMG ERROR] Unexpected", err);
     return res.status(404).send("Not found");
   }
 });
