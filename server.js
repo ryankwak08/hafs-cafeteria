@@ -773,26 +773,57 @@ function extractPhotoLinksFromHtml(html) {
 
   const links = [];
 
+  // Improved meal picker: prioritize 조식/중식/석식 in natural order, avoid misclassification
   const pickMealFromScope = (scopeText) => {
     const t = String(scopeText || "").replace(/\s+/g, " ").trim();
-    // Priority matters because some containers include multiple labels
+    // Prefer the closest/most specific label; check breakfast first (many containers include multiple labels)
+    if (t.includes("조식")) return "breakfast";
     if (t.includes("중식")) return "lunch";
     if (t.includes("석식")) return "dinner";
-    if (t.includes("조식")) return "breakfast";
     return null;
   };
 
+  // Fallback #1: scan <img> tags for uploaded cafeteria photos (sometimes no image_pop wrapper)
+  $("img").each((_, img) => {
+    const $img = $(img);
+    const srcRaw = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
+    if (!srcRaw) return;
+
+    const src = String(srcRaw).replace(/&amp;/g, "&").trim();
+
+    // Skip placeholders
+    if (src.includes("no_foodimg")) return;
+
+    // Heuristic: real uploaded meal photos usually live under /files/food/
+    const looksLikeFoodPhoto = src.includes("/files/food/") || (src.includes("/hosts/") && src.includes("/food/"));
+    if (!looksLikeFoodPhoto) return;
+
+    // Determine meal from nearby text
+    const scopeText = $img.closest("td, th, tr, .food, .wrap, table, div, li").text();
+    const meal = pickMealFromScope(scopeText);
+
+    // Store as an imgPath-like entry (absolute later)
+    links.push({ meal, imgPath: src });
+  });
+
+  // Broadened: extractImgParam now supports direct image URLs/paths as well as lunch.image_pop?img=
   const extractImgParam = (raw) => {
     if (!raw) return null;
     // Normalize HTML entities
-    const norm = String(raw).replace(/&amp;/g, "&");
+    const norm = String(raw).replace(/&amp;/g, "&").trim();
+
+    // If it's already a direct image path/url, just return it as-is.
+    if (
+      /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(norm) ||
+      norm.includes("/files/food/") ||
+      norm.includes("/hosts/")
+    ) {
+      return norm;
+    }
 
     // If it's an onclick like: viewImage('/?act=lunch.image_pop&img=...')
-    // try to isolate the URL-looking part
     let candidate = norm;
 
-    // Strip javascript wrappers if present
-    // Example: "javascript:openPop('...?act=lunch.image_pop&img=...');"
     const m1 = candidate.match(/(https?:\/\/[^'"\s)]+lunch\.image_pop[^'"\s)]+)/i);
     if (m1) candidate = m1[1];
 
