@@ -1046,36 +1046,35 @@ app.post("/kakao", async (req, res) => {
 
     // Photo flow
     const parsed = parseUtter(utter);
+
+    // 1) Explicit photo request: "사진|YYYYMMDD|breakfast|lunch|dinner"
     if (parsed.meal === "photo") {
       const ymd = parsed.photoYmd;
       const mealKey = parsed.photoMeal;
-      const titleKo = mealKo(mealKey);
-
       const userId = getUserId(req);
-const ctx = getLastMealCtx(userId);
 
-if (!ctx) return res.json(kakaoText("먼저 아침/점심/저녁 메뉴를 확인한 뒤, 식단 사진 보기를 눌러줘!", null));
+      // Try to fetch a fresh photo URL for that date/meal
+      const rawPhotoUrl = await fetchMealPhotoUrl(ymd, mealKey);
 
-// ✅ 사진 없음이 이미 확정이면 즉시 끝
-if (ctx.photoUrl === null) return res.json(kakaoText("식단 사진이 없습니다.", null));
+      // Cache context (positive or negative)
+      setLastMealCtx(userId, ymd, mealKey, rawPhotoUrl || null);
 
-// ✅ 캐시된 사진 URL이 있으면 네트워크 0회
-const rawPhotoUrl = ctx.photoUrl || (await fetchMealPhotoUrl(ctx.ymd, ctx.mealKey));
+      if (!rawPhotoUrl) {
+        return res.json(kakaoText("식단 사진이 없습니다.", null));
+      }
 
-if (!rawPhotoUrl) {
-  // 네트워크 실패/없음이면 다음 탭부터 바로 끝나게 음수 캐시
-  setLastMealCtx(userId, ctx.ymd, ctx.mealKey, null);
-  return res.json(kakaoText("식단 사진이 없습니다.", null));
-}
-
-// 성공이면 양수 캐시 갱신
-setLastMealCtx(userId, ctx.ymd, ctx.mealKey, rawPhotoUrl);
-
-const imgUrl = proxiedImageUrl(rawPhotoUrl);
-return res.json(kakaoImageCard(`📷 (${prettyYmd(ctx.ymd)}) ${mealKo(ctx.mealKey)}`, imgUrl, `(${prettyYmd(ctx.ymd)}) ${mealKo(ctx.mealKey)}`, null));
+      const imgUrl = proxiedImageUrl(rawPhotoUrl);
+      return res.json(
+        kakaoImageCard(
+          `📷 (${prettyYmd(ymd)}) ${mealKo(mealKey)}`,
+          imgUrl,
+          `(${prettyYmd(ymd)}) ${mealKo(mealKey)}`,
+          null
+        )
+      );
     }
 
-        // Photo flow (from stored context)
+    // 2) Button-based photo request: "식단 사진 보기" uses stored context from the last meal view
     if (parsed.meal === "photo_from_ctx") {
       const userId = getUserId(req);
       const ctx = getLastMealCtx(userId);
@@ -1084,18 +1083,32 @@ return res.json(kakaoImageCard(`📷 (${prettyYmd(ctx.ymd)}) ${mealKo(ctx.mealKe
         return res.json(kakaoText("먼저 아침/점심/저녁 메뉴를 확인한 뒤, 식단 사진 보기를 눌러줘!", null));
       }
 
-      const ymd = ctx.ymd;
-      const mealKey = ctx.mealKey;
-      const titleKo = mealKo(mealKey);
+      // ✅ If we already know there is no photo, respond immediately (no network)
+      if (ctx.photoUrl === null) {
+        return res.json(kakaoText("식단 사진이 없습니다.", null));
+      }
 
-      const rawPhotoUrl = await fetchMealPhotoUrl(ymd, mealKey);
+      // ✅ If we already cached the photo URL from the meal view, respond immediately (no network)
+      let rawPhotoUrl = ctx.photoUrl;
+      if (!rawPhotoUrl) {
+        // Only then hit the network
+        rawPhotoUrl = await fetchMealPhotoUrl(ctx.ymd, ctx.mealKey);
+        // Cache the result (positive or negative) so repeated clicks are instant
+        setLastMealCtx(userId, ctx.ymd, ctx.mealKey, rawPhotoUrl || null);
+      }
+
       if (!rawPhotoUrl) {
         return res.json(kakaoText("식단 사진이 없습니다.", null));
       }
 
       const imgUrl = proxiedImageUrl(rawPhotoUrl);
       return res.json(
-        kakaoImageCard(`📷 (${prettyYmd(ymd)}) ${titleKo}`, imgUrl, `(${prettyYmd(ymd)}) ${titleKo}`, null)
+        kakaoImageCard(
+          `📷 (${prettyYmd(ctx.ymd)}) ${mealKo(ctx.mealKey)}`,
+          imgUrl,
+          `(${prettyYmd(ctx.ymd)}) ${mealKo(ctx.mealKey)}`,
+          null
+        )
       );
     }
 
