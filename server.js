@@ -777,51 +777,82 @@ function extractPhotoLinksFromHtml(html) {
   // Returns mealKey -> absolute image URL (https://hafs.hs.kr/hosts/...) or null
   const $ = cheerio.load(String(html || ""));
 
-  // Collect candidate popup links in DOM order
   const links = [];
-  $("a[href*='lunch.image_pop'], a[onclick*='lunch.image_pop']").each((_, el) => {
+
+  const pickMealFromScope = (scopeText) => {
+    const t = String(scopeText || "").replace(/\s+/g, " ").trim();
+    // Priority matters because some containers include multiple labels
+    if (t.includes("중식")) return "lunch";
+    if (t.includes("석식")) return "dinner";
+    if (t.includes("조식")) return "breakfast";
+    return null;
+  };
+
+  const extractImgParam = (raw) => {
+    if (!raw) return null;
+    // Normalize HTML entities
+    const norm = String(raw).replace(/&amp;/g, "&");
+
+    // If it's an onclick like: viewImage('/?act=lunch.image_pop&img=...')
+    // try to isolate the URL-looking part
+    let candidate = norm;
+
+    // Strip javascript wrappers if present
+    // Example: "javascript:openPop('...?act=lunch.image_pop&img=...');"
+    const m1 = candidate.match(/(https?:\/\/[^'"\s)]+lunch\.image_pop[^'"\s)]+)/i);
+    if (m1) candidate = m1[1];
+
+    const m2 = candidate.match(/(\/?\?act=lunch\.image_pop[^'"\s)]+)/i);
+    if (m2) candidate = m2[1];
+
+    try {
+      const u = new URL(candidate, `https://${HAFS_HOST}/`);
+      const img = u.searchParams.get("img");
+      return img ? decodeURIComponent(img) : null;
+    } catch {
+      const m = candidate.match(/img=([^'"\s)]+)/i);
+      return m ? decodeURIComponent(m[1]) : null;
+    }
+  };
+
+  $("a[href*='lunch.image_pop'], a[onclick*='lunch.image_pop'], [onclick*='lunch.image_pop']").each((_, el) => {
     const $el = $(el);
     const href = $el.attr("href") || "";
     const onclick = $el.attr("onclick") || "";
+
     const raw = href.includes("lunch.image_pop") ? href : onclick;
-    if (!raw || !raw.includes("lunch.image_pop")) return;
+    if (!raw || !String(raw).includes("lunch.image_pop")) return;
 
-    // extract img param (works for href or onclick)
-    const m = raw.match(/img=([^'"\s)]+)/i);
-    if (!m) return;
-    const imgPath = decodeURIComponent(m[1]);
+    const imgPath = extractImgParam(raw);
+    if (!imgPath) return;
 
-    // Determine meal by nearby text
-    const scopeText = $el.closest("tr, td, div, li, table").text().replace(/\s+/g, " ").trim();
-    let meal = null;
-    if (scopeText.includes("조식")) meal = "breakfast";
-    else if (scopeText.includes("중식")) meal = "lunch";
-    else if (scopeText.includes("석식")) meal = "dinner";
+    // Determine meal from the closest reasonable scope
+    const scopeText = $el.closest("td, th, tr, .food, .lunch, .wrap, table, div, li").text();
+    const meal = pickMealFromScope(scopeText);
 
     links.push({ meal, imgPath });
   });
 
-  // Fallback: if meal couldn't be inferred, assign in order 조식/중식/석식
+  // Fallback assignment by order
   const orderedMeals = ["breakfast", "lunch", "dinner"];
   let fallbackIdx = 0;
+
   const result = { breakfast: null, lunch: null, dinner: null };
 
   for (const it of links) {
     const mealKey = it.meal || orderedMeals[fallbackIdx++] || null;
     if (!mealKey) continue;
-    if (result[mealKey]) continue; // keep first
+    if (result[mealKey]) continue;
 
-    // no-image placeholder handling
     if (String(it.imgPath).includes("no_foodimg")) {
       result[mealKey] = null;
       continue;
     }
 
-    // Build absolute image url.
-    // The popup uses img=/hosts/...; real file is served under https://hafs.hs.kr/hosts/...
-    const abs = it.imgPath.startsWith("/")
-      ? `https://${HAFS_HOST}${it.imgPath}`
-      : (it.imgPath.startsWith("http") ? it.imgPath : `https://${HAFS_HOST}/${it.imgPath}`);
+    const imgPath = String(it.imgPath);
+    const abs = imgPath.startsWith("http")
+      ? imgPath
+      : `https://${HAFS_HOST}${imgPath.startsWith("/") ? imgPath : "/" + imgPath}`;
 
     result[mealKey] = abs;
   }
@@ -967,6 +998,7 @@ app.get("/img", async (req, res) => {
         res.setHeader("Content-Disposition", "inline");
         res.setHeader("Cache-Control", "public, max-age=3600");
         res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Content-Length", String(buf.length));
         return res.status(200).send(buf);
       } catch (e) {
         lastErr = e;
