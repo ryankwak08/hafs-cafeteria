@@ -793,7 +793,7 @@ function sanitizeUtterance(raw) {
     // Kakao/clients sometimes send quoted replies like `quote>`
     .replace(/^\s*quote>\s*/i, "")
     // normalize fullwidth pipe and Korean vertical bar to normal pipe
-    .replace(/[｜ㅣ]/g, "|")
+    .replace(/[｜ㅣ∣¦│┃]/g, "|")
     // remove zero-width chars
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     // normalize newlines/spaces
@@ -836,6 +836,19 @@ function parseUtter(utterRaw) {
   // - "사진|YYYYMMDD|breakfast|" (trailing pipe)
   // - extra trailing text after the command (rare, but can happen)
   {
+    // 0) Loose matcher first: accept any separators/extra chars between tokens.
+    // This catches Kakao edge-cases where vertical bars arrive as unusual unicode.
+    const loose = utter.match(
+      /사진[^0-9]*(\d{8})[^0-9a-zA-Z가-힣]*(breakfast|lunch|dinner|아침|점심|저녁|조식|중식|석식)/i
+    );
+    if (loose) {
+      const ymd = String(loose[1] || "").trim();
+      const mealKey = normalizeMealKey(loose[2]);
+      if (/^\d{8}$/.test(ymd) && mealKey) {
+        return { utter: `사진|${ymd}|${mealKey}`, when: "photo", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
+      }
+    }
+
     // First try a split-based parser (most robust)
     const parts = utter.split("|").map((p) => String(p || "").trim()).filter((p) => p.length > 0);
 
