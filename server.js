@@ -35,7 +35,46 @@ async function getChromium() {
 // =========================================================
 
 const app = express();
+app.set("trust proxy", true);
 app.use(express.json());
+
+// --- Minimal request logger (useful when Kakao image fetch seems to not hit /img) ---
+// NOTE: Render shows stdout logs under the "Logs" tab (not build logs).
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path || "";
+
+  // Only log key routes to avoid noise
+  const shouldLog = path === "/kakao" || path === "/img" || path === "/menu";
+  if (!shouldLog) return next();
+
+  const ip = (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() || req.ip || req.socket?.remoteAddress || "";
+  const ua = (req.headers["user-agent"] || "").toString();
+
+  // Avoid printing huge query strings; keep it small
+  const q = req.query && Object.keys(req.query).length ? JSON.stringify(req.query).slice(0, 240) : "";
+
+  console.log("[REQ]", {
+    t: new Date().toISOString(),
+    method: req.method,
+    path,
+    ip,
+    ua: ua.slice(0, 120),
+    q,
+  });
+
+  res.on("finish", () => {
+    console.log("[RES]", {
+      t: new Date().toISOString(),
+      method: req.method,
+      path,
+      status: res.statusCode,
+      ms: Date.now() - start,
+    });
+  });
+
+  next();
+});
 
 // Agents (IPv4 first helps some networks)
 const httpsAgent = new https.Agent({ family: 4 });
@@ -859,15 +898,13 @@ function extractPhotoLinksFromHtml(html) {
     links.push({ meal, imgPath });
   });
 
-  // Fallback assignment by order
-  const orderedMeals = ["breakfast", "lunch", "dinner"];
-  let fallbackIdx = 0;
-
+  // Strict assignment: only assign when meal is clearly identified.
   const result = { breakfast: null, lunch: null, dinner: null };
 
   for (const it of links) {
-    const mealKey = it.meal || orderedMeals[fallbackIdx++] || null;
-    if (!mealKey) continue;
+    const mealKey = it.meal;
+    if (!mealKey) continue; // 🔒 Do NOT fallback by order
+
     if (result[mealKey]) continue;
 
     if (String(it.imgPath).includes("no_foodimg")) {
@@ -948,8 +985,10 @@ app.get("/img", async (req, res) => {
     console.log("[IMG HIT]", {
       time: new Date().toISOString(),
       raw,
+      host: (() => { try { return new URL(raw).hostname; } catch { return ""; } })(),
+      path: (() => { try { const u = new URL(raw); return (u.pathname || "") + (u.search || ""); } catch { return ""; } })(),
       ua: req.headers["user-agent"] || "",
-      ip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "",
+      ip: req.headers["x-forwarded-for"] || req.ip || req.socket?.remoteAddress || "",
     });
     if (!raw || !/^https?:\/\//i.test(raw)) return res.status(400).send("Bad url");
 
@@ -1212,6 +1251,13 @@ app.post("/kakao", async (req, res) => {
       // ✅ If a photo exists, show it together with the menu (no separate button)
       if (rawPhotoUrlForMeal) {
         const imgUrl = proxiedImageUrl(rawPhotoUrlForMeal);
+        console.log("[KAKAO IMAGE]", {
+          t: new Date().toISOString(),
+          meal,
+          ymd: from,
+          rawPhotoUrlForMeal,
+          imgUrl,
+        });
         return res.json(
           kakaoImageCard(
             text,
