@@ -615,7 +615,12 @@ function parseMealsFromJoinedText(joinedText) {
 
   let current = null;
   for (const line of lines) {
-    if (hardStopByLine(line)) break;
+    if (hardStopByLine(line)) {
+      // Ignore global nav/footer noise before meal sections begin.
+      // Stop only after we've already entered a meal block.
+      if (current) break;
+      continue;
+    }
 
     const marker = mealKeyFromLine(line);
     if (marker) {
