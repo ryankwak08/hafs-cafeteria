@@ -1607,6 +1607,33 @@ async function handleKakaoWebhook(req, res) {
       to = from;
     }
 
+    // Single-day full menu ("오늘"/"내일"): use day-page parser directly.
+    // Month-cell parsing can miss 일부 식사 when the calendar markup changes.
+    if (meal === "all" && from === to) {
+      const dayHtml = await fetchDayInfo(from);
+      const info = parseDayMealsFromPageHtml(dayHtml) || {};
+
+      const chunks = [];
+      if (info.breakfast) chunks.push(`• 조식\n${info.breakfast}`);
+      if (info.lunch) chunks.push(`• 중식\n${info.lunch}`);
+      if (info.dinner) {
+        let combined = `• 석식\n${info.dinner}`;
+        if (info.late) combined += `\n\n<야식>\n${info.late}`;
+        chunks.push(combined);
+      }
+
+      if (chunks.length === 0) {
+        return res.json(
+          kakaoText(
+            "해당 날짜의 급식 정보가 아직 등록되지 않았거나 제공되지 않는 날입니다."
+          )
+        );
+      }
+
+      const text = `📅 ${prettyYmd(from)}\n${chunks.join("\n\n")}`;
+      return res.json(kakaoText(text, null));
+    }
+
     // Fetch range map via month scrape (1~2 requests)
     const rangeMap = await fetchMonthMapForRange(from, to);
     // Debug: log when nothing parsed for the requested range
