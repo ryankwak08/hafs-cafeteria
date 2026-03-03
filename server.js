@@ -805,7 +805,18 @@ function sanitizeUtterance(raw) {
 }
 
 function parseUtter(utterRaw) {
-  const utter = sanitizeUtterance(utterRaw);
+  let utter = sanitizeUtterance(utterRaw);
+
+  // Robustness: some clients/quickReplies may send photo commands with `/` instead of `|`
+  // e.g. `사진/20260303|lunch` or `사진/20260303/lunch`
+  // Normalize ONLY when it looks like a photo command to avoid touching normal text.
+  if (/^사진\s*[\/|｜]/.test(utter) || utter.startsWith("사진/")) {
+    utter = utter.replace(/\//g, "|");
+    // Also normalize any accidental duplicated separators
+    utter = utter.replace(/\|{2,}/g, "|");
+    utter = utter.replace(/\s*\|\s*/g, "|");
+    utter = utter.replace(/^\s*사진\s*\|/g, "사진|");
+  }
 
   // Photo request: tolerate variations like
   // - "사진|YYYYMMDD|breakfast"
@@ -852,10 +863,9 @@ function parseUtter(utterRaw) {
   return { utter, when, meal };
 }
 function extractPhotoLinksFromHtml(html) {
-  // Returns mealKey -> absolute image URL (https://hafs.hs.kr/hosts/...) or null
+  // Returns mealKey -> absolute image URL (preferably the HAFS popup URL act=lunch.image_pop&img=...)
+  // We MUST avoid mixing meals (e.g., lunch returning breakfast photo).
   const $ = cheerio.load(String(html || ""));
-
-  const result = { breakfast: null, lunch: null, dinner: null };
 
   const toAbs = (p) => {
     if (!p) return null;
@@ -870,159 +880,138 @@ function extractPhotoLinksFromHtml(html) {
     const v = String(s || "");
     if (!v) return false;
     if (v.includes("no_foodimg")) return false;
-    return v.includes("/files/food/") || (v.includes("/hosts/") && v.includes("/food/"));
+    // popup OR direct image path
+    return v.includes("lunch.image_pop") || v.includes("/files/food/") || (v.includes("/hosts/") && v.includes("/food/"));
   };
 
-  const extractFromImagePop = (raw) => {
+  const extractPopupOrPath = (raw) => {
     if (!raw) return null;
     const norm = String(raw).replace(/&amp;/g, "&").trim();
+    if (!norm) return null;
 
-    // Direct path/url
-    if (looksLikeFood(norm) || /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(norm)) {
-      return norm;
-    }
+    // If it's already a direct food image path/url
+    if (norm.includes("/files/food/") || (norm.includes("/hosts/") && norm.includes("/files/food/"))) return norm;
 
-    // Parse ?act=lunch.image_pop&img=...
-    try {
-      const u = new URL(norm, `https://${HAFS_HOST}/`);
-      const img = u.searchParams.get("img");
-      return img ? decodeURIComponent(img) : null;
-    } catch {
-      const m = norm.match(/img=([^'"\s)]+)/i);
-      return m ? decodeURIComponent(m[1]) : null;
-    }
+    // If it's a popup URL, keep it (we normalize later in fetchMealPhotoUrl and /img)
+    if (norm.includes("lunch.image_pop")) return norm;
+
+    // If it's an onclick like: window.open('...?act=lunch.image_pop&img=...')
+    const mPop = norm.match(/(\?act=lunch\.image_pop[^'"\s)]*)/i);
+    if (mPop && mPop[1]) return mPop[1];
+
+    // If it contains img=...
+    const mImg = norm.match(/img=([^'"\s)]+)/i);
+    if (mImg && mImg[1]) return `?act=lunch.image_pop&img=${mImg[1]}`;
+
+    return null;
   };
 
-  // 1) 가장 안정적인 방식: '조식/중식/석식' 라벨이 들어있는 섹션(컨테이너)에서 사진 링크를 찾는다.
-  const labelToMealKey = {
-    "조식": "breakfast",
-    "중식": "lunch",
-    "석식": "dinner",
+  const pickFromScope = ($scope) => {
+    if (!$scope || $scope.length === 0) return null;
+
+    // 1) Prefer popup links (most reliable)
+    let found = null;
+    $scope.find("a").each((_, a) => {
+      if (found) return;
+      const $a = $(a);
+      const href = $a.attr("href") || "";
+      const onclick = $a.attr("onclick") || "";
+      const c1 = extractPopupOrPath(href);
+      const c2 = extractPopupOrPath(onclick);
+      const cand = c1 || c2;
+      if (cand && looksLikeFood(cand)) found = cand;
+    });
+    if (found) return toAbs(found);
+
+    // 2) Then try <img src=".../files/food/...">
+    $scope.find("img").each((_, img) => {
+      if (found) return;
+      const $img = $(img);
+      const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
+      const cand = extractPopupOrPath(src) || src;
+      if (cand && looksLikeFood(cand)) found = cand;
+    });
+    if (found) return toAbs(found);
+
+    // 3) Last resort: regex inside the scope HTML
+    const scopeHtml = String($scope.html() || "");
+    const m1 = scopeHtml.match(/(\?act=lunch\.image_pop[^"'\s>]*)/i);
+    if (m1 && m1[1]) return toAbs(m1[1]);
+    const m2 = scopeHtml.match(/(\/hosts\/[^"'\s>]+\/files\/food\/[^"'\s>]+)/i) || scopeHtml.match(/(\/files\/food\/[^"'\s>]+)/i);
+    if (m2 && m2[1]) return toAbs(m2[1]);
+
+    return null;
   };
 
-  const findPhotoNearLabel = (label) => {
-    // Cheerios :contains는 지원됨. 너무 광범위해지는 것을 막기 위해 컨테이너 태그로 제한.
-    const containers = $(
-      `td:contains('${label}'), th:contains('${label}'), tr:contains('${label}'), div:contains('${label}'), li:contains('${label}'), p:contains('${label}')`
+  // DOM-first: find the meal label marker and search in its nearest container.
+  // This avoids the classic bug where "중식" search accidentally grabs the first photo (조식).
+  const findByLabel = (label) => {
+    // Most pages show meal labels as images with alt/title.
+    const markers = $(
+      `img[alt*="${label}"], img[title*="${label}"], span:contains("${label}"), strong:contains("${label}")`
     ).toArray();
 
-    for (const el of containers) {
-      const $el = $(el);
+    for (const el of markers) {
+      const $m = $(el);
 
-      // (a) 섹션 내부에서 먼저 찾기
-      let found = null;
+      // Try several reasonable containers, from tight to broad
+      const scopes = [
+        $m.parent(),
+        $m.closest(".meal, .lunch, .lunch_list, .food, .menu, .tbl, .box, td, tr, table"),
+        $m.closest("td"),
+        $m.closest("table"),
+      ].filter((x) => x && x.length);
 
-      // 1) <a> href/onclick 에 직접 이미지 경로 또는 image_pop
-      $el.find("a").each((_, a) => {
-        if (found) return;
-        const $a = $(a);
-        const href = $a.attr("href") || "";
-        const onclick = $a.attr("onclick") || "";
-
-        // direct
-        if (looksLikeFood(href)) found = href;
-        if (!found && looksLikeFood(onclick)) found = onclick;
-
-        // image_pop
-        if (!found && (href.includes("lunch.image_pop") || onclick.includes("lunch.image_pop"))) {
-          found = extractFromImagePop(href.includes("lunch.image_pop") ? href : onclick);
-        }
-      });
-
-      // 2) <img src>
-      if (!found) {
-        $el.find("img").each((_, img) => {
-          if (found) return;
-          const $img = $(img);
-          const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
-          if (looksLikeFood(src)) found = src;
-        });
+      for (const sc of scopes) {
+        const url = pickFromScope(sc);
+        if (url) return url;
       }
-
-      // (b) 섹션 바로 다음 형제/근처에서 찾기 (라벨/사진이 분리되어 있는 경우)
-      if (!found) {
-        const $sib = $el.nextAll("td, th, div, p").first();
-        if ($sib && $sib.length) {
-          $sib.find("a").each((_, a) => {
-            if (found) return;
-            const $a = $(a);
-            const href = $a.attr("href") || "";
-            const onclick = $a.attr("onclick") || "";
-            if (looksLikeFood(href)) found = href;
-            if (!found && looksLikeFood(onclick)) found = onclick;
-            if (!found && (href.includes("lunch.image_pop") || onclick.includes("lunch.image_pop"))) {
-              found = extractFromImagePop(href.includes("lunch.image_pop") ? href : onclick);
-            }
-          });
-          if (!found) {
-            $sib.find("img").each((_, img) => {
-              if (found) return;
-              const $img = $(img);
-              const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
-              if (looksLikeFood(src)) found = src;
-            });
-          }
-        }
-      }
-
-      if (found) return toAbs(found);
     }
 
     return null;
   };
 
-  for (const [label, mealKey] of Object.entries(labelToMealKey)) {
-    const url = findPhotoNearLabel(label);
-    if (url) result[mealKey] = url;
-  }
+  const result = { breakfast: null, lunch: null, dinner: null };
 
-  // 2) 라벨 기반으로 못 찾는 경우가 있어서, 전역 스캔 후 "등장 순서"로 남은 칸을 채운다.
+  // 1) Label-scoped extraction (most accurate)
+  result.breakfast = findByLabel("조식");
+  result.lunch = findByLabel("중식");
+  result.dinner = findByLabel("석식");
+
+  // 2) Fallback fill: collect all unique food images on the page, then fill missing slots
+  // WITHOUT duplicating already used ones.
   const ordered = [];
-
-  // anchors
   $("a").each((_, a) => {
     const $a = $(a);
     const href = $a.attr("href") || "";
     const onclick = $a.attr("onclick") || "";
-
-    let candidate = null;
-    if (looksLikeFood(href)) candidate = href;
-    else if (looksLikeFood(onclick)) candidate = onclick;
-    else if (href.includes("lunch.image_pop") || onclick.includes("lunch.image_pop")) {
-      candidate = extractFromImagePop(href.includes("lunch.image_pop") ? href : onclick);
-    }
-
-    if (candidate && looksLikeFood(candidate)) {
-      ordered.push(toAbs(candidate));
-    }
+    const cand = extractPopupOrPath(href) || extractPopupOrPath(onclick);
+    if (cand && looksLikeFood(cand)) ordered.push(toAbs(cand));
   });
-
-  // imgs
   $("img").each((_, img) => {
     const $img = $(img);
     const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
-    if (looksLikeFood(src)) ordered.push(toAbs(src));
+    const cand = extractPopupOrPath(src) || src;
+    if (cand && looksLikeFood(cand)) ordered.push(toAbs(cand));
   });
 
-  // de-dupe keep order
   const seen = new Set();
-  const uniqOrdered = [];
+  const uniq = [];
   for (const u of ordered) {
     if (!u) continue;
     if (u.includes("no_foodimg")) continue;
     if (seen.has(u)) continue;
     seen.add(u);
-    uniqOrdered.push(u);
+    uniq.push(u);
   }
 
-  const fillOrder = ["breakfast", "lunch", "dinner"];
-  let idx = 0;
-  for (const k of fillOrder) {
+  const used = new Set(Object.values(result).filter(Boolean));
+  for (const k of ["breakfast", "lunch", "dinner"]) {
     if (result[k]) continue;
-    while (idx < uniqOrdered.length && !uniqOrdered[idx]) idx++;
-    if (idx < uniqOrdered.length) {
-      result[k] = uniqOrdered[idx];
-      idx++;
+    const next = uniq.find((u) => u && !used.has(u));
+    if (next) {
+      result[k] = next;
+      used.add(next);
     }
   }
 
