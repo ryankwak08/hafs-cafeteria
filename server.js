@@ -107,7 +107,8 @@ function menuQuickReplies() {
 }
 
 function photoQuickReply(ymd, mealKey) {
-  return [{ label: "식단 사진 보기", action: "message", messageText: `사진|${ymd}|${mealKey}` }];
+  const mealKor = mealKey === "breakfast" ? "아침" : mealKey === "lunch" ? "점심" : mealKey === "dinner" ? "저녁" : mealKey;
+  return [{ label: "식단 사진 보기", action: "message", messageText: `사진 ${ymd} ${mealKor}` }];
 }
 
 function kakaoText(text, quickReplies = menuQuickReplies()) {
