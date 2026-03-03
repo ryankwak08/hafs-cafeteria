@@ -783,18 +783,56 @@ async function fetchMonthMapForRange(fromYmd, toYmd) {
 }
 
 // ----------------- Request parsing -----------------
-function parseUtter(utterRaw) {
-  const utter = (utterRaw || "").trim();
+function sanitizeUtterance(raw) {
+  // Kakao / some clients may prefix quoted replies like `quote>` or include zero-width chars.
+  const s0 = String(raw ?? "");
+  // Normalize non-breaking spaces and other common invisible separators
+  // (Kakao sometimes injects NBSP or thin spaces that don't match typical trims)
+  const s1 = s0.replace(/[\u00A0\u202F\u2000-\u200A]/g, " ");
+  return s1
+    // Kakao/clients sometimes send quoted replies like `quote>`
+    .replace(/^\s*quote>\s*/i, "")
+    // normalize fullwidth pipe to normal pipe
+    .replace(/｜/g, "|")
+    // remove zero-width chars
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    // normalize newlines/spaces
+    .replace(/\r\n/g, "\n")
+    .replace(/\s+/g, " ")
+    .trim()
+    // normalize spacing around separators for photo command
+    .replace(/\s*\|\s*/g, "|");
+}
 
-  // Photo request: "사진|YYYYMMDD|breakfast|lunch|dinner"
-  if (utter.startsWith("사진|")) {
-    const parts = utter.split("|");
-    const ymd = (parts[1] || "").trim();
-    const mealKey = (parts[2] || "").trim().toLowerCase();
-    const okYmd = /^\d{8}$/.test(ymd);
-    const okMeal = ["breakfast", "lunch", "dinner"].includes(mealKey);
-    if (okYmd && okMeal) {
-      return { utter, when: "photo", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
+function parseUtter(utterRaw) {
+  const utter = sanitizeUtterance(utterRaw);
+
+  // Photo request: tolerate variations like
+  // - "사진|YYYYMMDD|breakfast"
+  // - "사진 | YYYYMMDD | breakfast"
+  // - "사진|YYYYMMDD|breakfast|" (trailing pipe)
+  // - extra trailing text after the command (rare, but can happen)
+  {
+    // First try a split-based parser (most robust)
+    const parts = utter.split("|").map((p) => String(p || "").trim()).filter((p) => p.length > 0);
+
+    // Accept: ["사진", "YYYYMMDD", "meal"] (+ ignore extras)
+    if (parts.length >= 3 && parts[0] === "사진") {
+      const ymd = parts[1];
+      const mealKey = String(parts[2]).toLowerCase();
+      if (/^\d{8}$/.test(ymd) && ["breakfast", "lunch", "dinner"].includes(mealKey)) {
+        return { utter: `사진|${ymd}|${mealKey}`, when: "photo", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
+      }
+    }
+
+    // Fallback: regex (allows trailing pipe/whitespace)
+    const m = utter.match(/^사진\|(\d{8})\|(breakfast|lunch|dinner)(?:\|.*)?$/i);
+    if (m) {
+      const ymd = String(m[1] || "").trim();
+      const mealKey = String(m[2] || "").trim().toLowerCase();
+      if (/^\d{8}$/.test(ymd) && ["breakfast", "lunch", "dinner"].includes(mealKey)) {
+        return { utter: `사진|${ymd}|${mealKey}`, when: "photo", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
+      }
     }
   }
 
@@ -817,113 +855,175 @@ function extractPhotoLinksFromHtml(html) {
   // Returns mealKey -> absolute image URL (https://hafs.hs.kr/hosts/...) or null
   const $ = cheerio.load(String(html || ""));
 
-  const links = [];
+  const result = { breakfast: null, lunch: null, dinner: null };
 
-  // Improved meal picker: prioritize 조식/중식/석식 in natural order, avoid misclassification
-  const pickMealFromScope = (scopeText) => {
-    const t = String(scopeText || "").replace(/\s+/g, " ").trim();
-    // Prefer the closest/most specific label; check breakfast first (many containers include multiple labels)
-    if (t.includes("조식")) return "breakfast";
-    if (t.includes("중식")) return "lunch";
-    if (t.includes("석식")) return "dinner";
-    return null;
+  const toAbs = (p) => {
+    if (!p) return null;
+    const s = String(p).replace(/&amp;/g, "&").trim();
+    if (!s) return null;
+    if (/^https?:\/\//i.test(s)) return s;
+    const path = s.startsWith("/") ? s : `/${s}`;
+    return `https://${HAFS_HOST}${path}`;
   };
 
-  // Fallback #1: scan <img> tags for uploaded cafeteria photos (sometimes no image_pop wrapper)
-  $("img").each((_, img) => {
-    const $img = $(img);
-    const srcRaw = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
-    if (!srcRaw) return;
+  const looksLikeFood = (s) => {
+    const v = String(s || "");
+    if (!v) return false;
+    if (v.includes("no_foodimg")) return false;
+    return v.includes("/files/food/") || (v.includes("/hosts/") && v.includes("/food/"));
+  };
 
-    const src = String(srcRaw).replace(/&amp;/g, "&").trim();
-
-    // Skip placeholders
-    if (src.includes("no_foodimg")) return;
-
-    // Heuristic: real uploaded meal photos usually live under /files/food/
-    const looksLikeFoodPhoto = src.includes("/files/food/") || (src.includes("/hosts/") && src.includes("/food/"));
-    if (!looksLikeFoodPhoto) return;
-
-    // Determine meal from nearby text
-    const scopeText = $img.closest("td, th, tr, .food, .wrap, table, div, li").text();
-    const meal = pickMealFromScope(scopeText);
-
-    // Store as an imgPath-like entry (absolute later)
-    links.push({ meal, imgPath: src });
-  });
-
-  // Broadened: extractImgParam now supports direct image URLs/paths as well as lunch.image_pop?img=
-  const extractImgParam = (raw) => {
+  const extractFromImagePop = (raw) => {
     if (!raw) return null;
-    // Normalize HTML entities
     const norm = String(raw).replace(/&amp;/g, "&").trim();
 
-    // If it's already a direct image path/url, just return it as-is.
-    if (
-      /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(norm) ||
-      norm.includes("/files/food/") ||
-      norm.includes("/hosts/")
-    ) {
+    // Direct path/url
+    if (looksLikeFood(norm) || /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(norm)) {
       return norm;
     }
 
-    // If it's an onclick like: viewImage('/?act=lunch.image_pop&img=...')
-    let candidate = norm;
-
-    const m1 = candidate.match(/(https?:\/\/[^'"\s)]+lunch\.image_pop[^'"\s)]+)/i);
-    if (m1) candidate = m1[1];
-
-    const m2 = candidate.match(/(\/?\?act=lunch\.image_pop[^'"\s)]+)/i);
-    if (m2) candidate = m2[1];
-
+    // Parse ?act=lunch.image_pop&img=...
     try {
-      const u = new URL(candidate, `https://${HAFS_HOST}/`);
+      const u = new URL(norm, `https://${HAFS_HOST}/`);
       const img = u.searchParams.get("img");
       return img ? decodeURIComponent(img) : null;
     } catch {
-      const m = candidate.match(/img=([^'"\s)]+)/i);
+      const m = norm.match(/img=([^'"\s)]+)/i);
       return m ? decodeURIComponent(m[1]) : null;
     }
   };
 
-  $("a[href*='lunch.image_pop'], a[onclick*='lunch.image_pop'], [onclick*='lunch.image_pop']").each((_, el) => {
-    const $el = $(el);
-    const href = $el.attr("href") || "";
-    const onclick = $el.attr("onclick") || "";
+  // 1) 가장 안정적인 방식: '조식/중식/석식' 라벨이 들어있는 섹션(컨테이너)에서 사진 링크를 찾는다.
+  const labelToMealKey = {
+    "조식": "breakfast",
+    "중식": "lunch",
+    "석식": "dinner",
+  };
 
-    const raw = href.includes("lunch.image_pop") ? href : onclick;
-    if (!raw || !String(raw).includes("lunch.image_pop")) return;
+  const findPhotoNearLabel = (label) => {
+    // Cheerios :contains는 지원됨. 너무 광범위해지는 것을 막기 위해 컨테이너 태그로 제한.
+    const containers = $(
+      `td:contains('${label}'), th:contains('${label}'), tr:contains('${label}'), div:contains('${label}'), li:contains('${label}'), p:contains('${label}')`
+    ).toArray();
 
-    const imgPath = extractImgParam(raw);
-    if (!imgPath) return;
+    for (const el of containers) {
+      const $el = $(el);
 
-    // Determine meal from the closest reasonable scope
-    const scopeText = $el.closest("td, th, tr, .food, .lunch, .wrap, table, div, li").text();
-    const meal = pickMealFromScope(scopeText);
+      // (a) 섹션 내부에서 먼저 찾기
+      let found = null;
 
-    links.push({ meal, imgPath });
-  });
+      // 1) <a> href/onclick 에 직접 이미지 경로 또는 image_pop
+      $el.find("a").each((_, a) => {
+        if (found) return;
+        const $a = $(a);
+        const href = $a.attr("href") || "";
+        const onclick = $a.attr("onclick") || "";
 
-  // Strict assignment: only assign when meal is clearly identified.
-  const result = { breakfast: null, lunch: null, dinner: null };
+        // direct
+        if (looksLikeFood(href)) found = href;
+        if (!found && looksLikeFood(onclick)) found = onclick;
 
-  for (const it of links) {
-    const mealKey = it.meal;
-    if (!mealKey) continue; // 🔒 Do NOT fallback by order
+        // image_pop
+        if (!found && (href.includes("lunch.image_pop") || onclick.includes("lunch.image_pop"))) {
+          found = extractFromImagePop(href.includes("lunch.image_pop") ? href : onclick);
+        }
+      });
 
-    if (result[mealKey]) continue;
+      // 2) <img src>
+      if (!found) {
+        $el.find("img").each((_, img) => {
+          if (found) return;
+          const $img = $(img);
+          const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
+          if (looksLikeFood(src)) found = src;
+        });
+      }
 
-    if (String(it.imgPath).includes("no_foodimg")) {
-      result[mealKey] = null;
-      continue;
+      // (b) 섹션 바로 다음 형제/근처에서 찾기 (라벨/사진이 분리되어 있는 경우)
+      if (!found) {
+        const $sib = $el.nextAll("td, th, div, p").first();
+        if ($sib && $sib.length) {
+          $sib.find("a").each((_, a) => {
+            if (found) return;
+            const $a = $(a);
+            const href = $a.attr("href") || "";
+            const onclick = $a.attr("onclick") || "";
+            if (looksLikeFood(href)) found = href;
+            if (!found && looksLikeFood(onclick)) found = onclick;
+            if (!found && (href.includes("lunch.image_pop") || onclick.includes("lunch.image_pop"))) {
+              found = extractFromImagePop(href.includes("lunch.image_pop") ? href : onclick);
+            }
+          });
+          if (!found) {
+            $sib.find("img").each((_, img) => {
+              if (found) return;
+              const $img = $(img);
+              const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
+              if (looksLikeFood(src)) found = src;
+            });
+          }
+        }
+      }
+
+      if (found) return toAbs(found);
     }
 
-    const imgPath = String(it.imgPath);
-    const abs = imgPath.startsWith("http")
-      ? imgPath
-      : `https://${HAFS_HOST}${imgPath.startsWith("/") ? imgPath : "/" + imgPath}`;
+    return null;
+  };
 
-    result[mealKey] = abs;
+  for (const [label, mealKey] of Object.entries(labelToMealKey)) {
+    const url = findPhotoNearLabel(label);
+    if (url) result[mealKey] = url;
+  }
+
+  // 2) 라벨 기반으로 못 찾는 경우가 있어서, 전역 스캔 후 "등장 순서"로 남은 칸을 채운다.
+  const ordered = [];
+
+  // anchors
+  $("a").each((_, a) => {
+    const $a = $(a);
+    const href = $a.attr("href") || "";
+    const onclick = $a.attr("onclick") || "";
+
+    let candidate = null;
+    if (looksLikeFood(href)) candidate = href;
+    else if (looksLikeFood(onclick)) candidate = onclick;
+    else if (href.includes("lunch.image_pop") || onclick.includes("lunch.image_pop")) {
+      candidate = extractFromImagePop(href.includes("lunch.image_pop") ? href : onclick);
+    }
+
+    if (candidate && looksLikeFood(candidate)) {
+      ordered.push(toAbs(candidate));
+    }
+  });
+
+  // imgs
+  $("img").each((_, img) => {
+    const $img = $(img);
+    const src = $img.attr("src") || $img.attr("data-src") || $img.attr("data-original") || "";
+    if (looksLikeFood(src)) ordered.push(toAbs(src));
+  });
+
+  // de-dupe keep order
+  const seen = new Set();
+  const uniqOrdered = [];
+  for (const u of ordered) {
+    if (!u) continue;
+    if (u.includes("no_foodimg")) continue;
+    if (seen.has(u)) continue;
+    seen.add(u);
+    uniqOrdered.push(u);
+  }
+
+  const fillOrder = ["breakfast", "lunch", "dinner"];
+  let idx = 0;
+  for (const k of fillOrder) {
+    if (result[k]) continue;
+    while (idx < uniqOrdered.length && !uniqOrdered[idx]) idx++;
+    if (idx < uniqOrdered.length) {
+      result[k] = uniqOrdered[idx];
+      idx++;
+    }
   }
 
   return result;
@@ -940,10 +1040,47 @@ async function fetchMealPhotoUrl(ymd, mealKey) {
 
   const html = await fetchDayInfo(ymd);
   const map = extractPhotoLinksFromHtml(html);
-  const url = map?.[mealKey] || null;
+  let url = map?.[mealKey] || null;
 
-  if (url) photoUrlCache.set(key, { url, ts: now });
+  // Normalize HAFS popup URL (act=lunch.image_pop&img=...) -> direct image URL
+  const normalizePopupToDirect = (input) => {
+    if (!input) return null;
+    try {
+      const u = new URL(String(input));
+      const act = String(u.searchParams.get("act") || "").toLowerCase();
+      const img = u.searchParams.get("img");
+      if (act.includes("lunch.image_pop") && img) {
+        const decoded = decodeURIComponent(img);
+        const preferredScheme = "http"; // NitroEye blocks https more often
+        if (/^https?:\/\//i.test(decoded)) {
+          return decoded.replace(/^https:\/\//i, `${preferredScheme}://`).replace(/^http:\/\//i, `${preferredScheme}://`);
+        }
+        if (decoded.startsWith("/")) return `${preferredScheme}://${HAFS_HOST}${decoded}`;
+        return `${preferredScheme}://${HAFS_HOST}/${decoded}`;
+      }
 
+      // Prefer http for direct HAFS image paths
+      if (u.hostname === HAFS_HOST && /^https:\/\//i.test(String(input))) {
+        return String(input).replace(/^https:\/\//i, "http://");
+      }
+    } catch {
+      // ignore
+    }
+    return input;
+  };
+
+  url = normalizePopupToDirect(url);
+
+  // If we still don't have a plausible URL, return null
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+
+  // NOTE: We intentionally do NOT "HEAD-validate" the upstream image here.
+  // Reason: HAFS/NitroEye frequently blocks HEAD/HTTPS or requires cookies,
+  // which causes false negatives like "식단 사진이 없습니다." even when the photo exists.
+  // The /img proxy already handles popup->direct extraction, HTTP preference, cookies, and fallback.
+
+  // Cache and return
+  photoUrlCache.set(key, { url, ts: now });
   return url;
 }
 
@@ -985,27 +1122,111 @@ app.post("/menu", (req, res) => {
 // Optional image proxy (used by photo features)
 // Kakao fetches the image from imageUrl server-side. If the file is too large/slow, Kakao may time out.
 // So we: (1) cache, (2) prefer HTTP upstream, (3) compress/resize when large.
+// 1x1 transparent PNG placeholder (prevents Kakao from showing a broken Not Found page)
+const TRANSPARENT_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO9WlKkAAAAASUVORK5CYII=",
+  "base64"
+);
+function sendTransparentPng(res) {
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Content-Disposition", "inline");
+  res.setHeader("Cache-Control", "public, max-age=60");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Content-Length", String(TRANSPARENT_PNG.length));
+  return res.status(200).send(TRANSPARENT_PNG);
+}
+
+app.head("/img", (req, res) => {
+  // Kakao (kakaotalk-scrap / facebookexternalhit) often sends HEAD first.
+  // Do NOT fetch upstream on HEAD; just return image-like headers quickly.
+  res.setHeader("Content-Type", "image/jpeg");
+  res.setHeader("Content-Disposition", "inline");
+  res.setHeader("Cache-Control", "public, max-age=60");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  return res.status(200).end();
+});
+
 app.get("/img", async (req, res) => {
   try {
     const raw = String(req.query.url || "");
+    // If the incoming URL is a HAFS popup page (act=lunch.image_pop&img=...),
+    // rewrite it to the *real* image URL before doing any network fetch.
+    // This avoids fetching HTML first and fixes NOT_IMAGE_* failures.
+    const normalizeImagePopToDirect = (input) => {
+      try {
+        const u = new URL(String(input));
+        const act = String(u.searchParams.get("act") || "").toLowerCase();
+        const img = u.searchParams.get("img");
+
+        // HAFS photo popup -> direct image path
+        if (act.includes("lunch.image_pop") && img) {
+          const decoded = decodeURIComponent(img);
+
+          // Prefer HTTP upstream (NitroEye blocks HTTPS frequently)
+          const preferredScheme = "http";
+
+          if (/^https?:\/\//i.test(decoded)) {
+            // Force scheme to http for upstream fetch
+            return decoded.replace(/^https:\/\//i, `${preferredScheme}://`).replace(/^http:\/\//i, `${preferredScheme}://`);
+          }
+
+          if (decoded.startsWith("/")) return `${preferredScheme}://${HAFS_HOST}${decoded}`;
+          return `${preferredScheme}://${HAFS_HOST}/${decoded}`;
+        }
+
+        // If it's already a direct path on HAFS, also prefer HTTP
+        const s = String(input);
+        if (/^https:\/\//i.test(s) && u.hostname === HAFS_HOST) {
+          return s.replace(/^https:\/\//i, "http://");
+        }
+      } catch {
+        // ignore
+      }
+      return input;
+    };
+
+    const rawNormalized = normalizeImagePopToDirect(raw);
     console.log("[IMG HIT]", {
       time: new Date().toISOString(),
       raw,
-      host: (() => { try { return new URL(raw).hostname; } catch { return ""; } })(),
-      path: (() => { try { const u = new URL(raw); return (u.pathname || "") + (u.search || ""); } catch { return ""; } })(),
+      rawNormalized,
+      host: (() => { try { return new URL(rawNormalized).hostname; } catch { return ""; } })(),
+      path: (() => { try { const u = new URL(rawNormalized); return (u.pathname || "") + (u.search || ""); } catch { return ""; } })(),
       ua: req.headers["user-agent"] || "",
       ip: req.headers["x-forwarded-for"] || req.ip || req.socket?.remoteAddress || "",
     });
-    if (!raw || !/^https?:\/\//i.test(raw)) return res.status(400).send("Bad url");
+    if (!rawNormalized || !/^https?:\/\//i.test(rawNormalized)) {
+      // Avoid Kakao showing an error card; return a tiny valid image.
+      return sendTransparentPng(res);
+    }
 
-    const u0 = new URL(raw);
+    const u0 = new URL(rawNormalized);
     const allowedHosts = new Set(["hafs.hs.kr"]);
     if (HAFS_IP_FALLBACK) allowedHosts.add(HAFS_IP_FALLBACK);
-    if (!allowedHosts.has(u0.hostname)) return res.status(403).send("Forbidden");
+    if (!allowedHosts.has(u0.hostname)) {
+      console.error("[IMG FORBIDDEN HOST]", { host: u0.hostname, rawNormalized });
+      return sendTransparentPng(res);
+    }
 
     // Normalize cache key (keep original + normalized schemes)
-    const httpRaw = raw.replace(/^https:\/\//i, "http://");
-    const httpsRaw = raw.replace(/^http:\/\//i, "https://");
+    const httpRaw = rawNormalized.replace(/^https:\/\//i, "http://");
+    const httpsRaw = rawNormalized.replace(/^http:\/\//i, "https://");
+
+    // If IP fallback is configured, prepare IP-based URLs (still sending Host header).
+    const toIpIfNeeded = (url) => {
+      if (!HAFS_IP_FALLBACK) return url;
+      try {
+        const uu = new URL(url);
+        if (uu.hostname !== HAFS_HOST) return url;
+        uu.hostname = HAFS_IP_FALLBACK;
+        return uu.toString();
+      } catch {
+        return url;
+      }
+    };
+
+    const httpIp = toIpIfNeeded(httpRaw);
+    const httpsIp = toIpIfNeeded(httpsRaw);
 
     const now = Date.now();
     const pickCached = (key) => {
@@ -1019,24 +1240,53 @@ app.get("/img", async (req, res) => {
     };
 
     // Serve from cache immediately if possible
-    const cached = pickCached(raw) || pickCached(httpRaw) || pickCached(httpsRaw);
+    const cached = pickCached(rawNormalized) || pickCached(httpRaw) || pickCached(httpsRaw);
     if (cached && cached.buf && cached.ct) {
       res.setHeader("Content-Type", cached.ct);
       res.setHeader("Content-Disposition", "inline");
       res.setHeader("Cache-Control", "public, max-age=3600");
       res.setHeader("Access-Control-Allow-Origin", "*");
+      if (req.method === "HEAD") return res.status(200).end();
       res.setHeader("Content-Length", String(cached.buf.length));
       return res.status(200).send(cached.buf);
     }
 
-    // 🔥 upstream은 HTTP를 우선 시도 (NitroEye가 https만 막는 경우가 많음)
-    const candidates = [httpRaw, httpsRaw];
+    // 1) axios로 빠르게 시도 (리다이렉트는 수동으로 2~3번만 따라간다)
+    const fetchOnce = async (url) => {
+      const uu = new URL(url);
+      const isIpHost = Boolean(HAFS_IP_FALLBACK && uu.hostname === HAFS_IP_FALLBACK);
+
+      const resp = await axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: 5500,
+        maxRedirects: 0,
+        validateStatus: (s) => s >= 200 && s < 400,
+        httpsAgent: isIpHost ? httpsAgentHafsIp : httpsAgent,
+        httpAgent,
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          Referer: "http://hafs.hs.kr/",
+          ...(isIpHost ? { Host: HAFS_HOST } : {}),
+          ...(HAFS_COOKIE ? { Cookie: HAFS_COOKIE } : {}),
+        },
+      });
+
+      updateCookieFromResponse(resp);
+      return resp;
+    };
 
     const isNitro = (resp, buf) => {
       const loc = String(resp?.headers?.location || "");
       if (loc.includes("nitroeye.co.kr/404_firewall")) return true;
       const body = buf ? buf.toString("utf-8") : "";
       return body.includes("nitroeye.co.kr/404_firewall") || body.includes("404_firewall");
+    };
+
+    const isHtmlLike = (ct, buf) => {
+      const ctL = String(ct || "").toLowerCase();
+      if (ctL.includes("text/html")) return true;
+      const head = buf ? buf.toString("utf-8", 0, Math.min(buf.length, 300)) : "";
+      return head.includes("<!DOCTYPE") || head.includes("<html") || head.includes("404_firewall") || head.includes("nitroeye");
     };
 
     const sendBuf = (buf, ct) => {
@@ -1082,78 +1332,179 @@ app.get("/img", async (req, res) => {
       return { buf, ct };
     };
 
-    let lastErr = null;
-
-    // 1) axios로 빠르게 시도
-    for (const url of candidates) {
+    const followRedirect = (currentUrl, location) => {
       try {
-        const uu = new URL(url);
-        const isIpHost = HAFS_IP_FALLBACK && uu.hostname === HAFS_IP_FALLBACK;
+        return new URL(String(location || ""), currentUrl).toString();
+      } catch {
+        return String(location || "");
+      }
+    };
 
-        const resp = await axios.get(url, {
-          responseType: "arraybuffer",
-          timeout: 7000,
-          maxRedirects: 0,
-          validateStatus: (s) => s >= 200 && s < 400,
-          httpsAgent: isIpHost ? httpsAgentHafsIp : httpsAgent,
-          httpAgent,
-          headers: {
-            "User-Agent": "Mozilla/5.0",
-            Referer: "https://hafs.hs.kr/",
-            ...(isIpHost ? { Host: "hafs.hs.kr" } : {}),
-            ...(HAFS_COOKIE ? { Cookie: HAFS_COOKIE } : {}),
-          },
-        });
-
-        const ctRaw = String(resp.headers["content-type"] || "").toLowerCase();
+    const tryFetchImage = async (startUrl) => {
+      let cur = startUrl;
+      for (let i = 0; i < 2; i++) {
+        const resp = await fetchOnce(cur);
         const buf0 = Buffer.from(resp.data || []);
 
-        if (isNitro(resp, buf0)) throw Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
-        if (!ctRaw.startsWith("image/")) throw new Error("NOT_IMAGE");
+        // Handle redirects FIRST (avoid treating 301/302 HTML bodies as non-image)
+        if (resp.status >= 300 && resp.status < 400) {
+          const loc = String(resp.headers?.location || "");
+          if (!loc) throw new Error("REDIRECT_WITHOUT_LOCATION");
+          if (loc.includes("nitroeye.co.kr/404_firewall")) {
+            const err = Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
+            throw err;
+          }
+          cur = followRedirect(cur, loc);
+          continue;
+        }
+
+        const ctMaybe = String(resp?.headers?.["content-type"] || "").toLowerCase();
+        const htmlLike = isHtmlLike(ctMaybe, buf0);
+
+        // NitroEye / firewall detection
+        if (isNitro(resp, buf0)) {
+          const err = Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
+          throw err;
+        }
+
+        if (htmlLike) {
+          // Some HAFS photo links are NOT direct images.
+          // Example: https://hafs.hs.kr/?act=lunch.image_pop&img=/hosts/hafs.hs.kr/files/food/...
+          // In that case, we can extract the `img` query param and fetch the real image directly.
+          try {
+            const curUrl = new URL(cur);
+            const act = (curUrl.searchParams.get("act") || "").toLowerCase();
+            const imgParam = curUrl.searchParams.get("img");
+            if (act.includes("lunch.image_pop") && imgParam) {
+              const scheme = String(cur || "").toLowerCase().startsWith("http://") ? "http" : "https";
+              let extracted = decodeURIComponent(imgParam);
+              if (!/^https?:\/\//i.test(extracted)) {
+                extracted = extracted.startsWith("/")
+                  ? `${scheme}://${HAFS_HOST}${extracted}`
+                  : `${scheme}://${HAFS_HOST}/${extracted}`;
+              } else {
+                // normalize to current scheme (HTTP often works when HTTPS is blocked)
+                extracted = extracted.replace(/^https:\/\//i, `${scheme}://`);
+              }
+
+              // IMPORTANT: prefer HTTP first to avoid NitroEye/HTTPS blocks in some environments
+              cur = extracted.replace(/^https:\/\//i, "http://");
+              continue;
+            }
+          } catch {
+            // ignore
+          }
+
+          const html = buf0.toString("utf-8");
+
+          // If it is the HAFS popup page, it usually includes an <img> tag pointing to
+          // /files/food/... or /hosts/.../files/food/...
+          // Extract the first matching image and retry using that URL.
+          const $h = cheerio.load(html);
+          let extracted = null;
+          $h("img").each((_, img) => {
+            if (extracted) return;
+            const src = $h(img).attr("src") || "";
+            if (!src) return;
+            if (src.includes("no_foodimg")) return;
+            if (src.includes("/files/food/") || (src.includes("/hosts/") && src.includes("/files/food/"))) {
+              extracted = src;
+            }
+          });
+
+          // Fallback regex extraction (covers cases where HTML is not well-formed)
+          if (!extracted) {
+            const mSrc = html.match(/src\s*=\s*["']([^"']*(?:\/hosts\/[^"']+\/)?files\/food\/[^"']+)["']/i);
+            if (mSrc && mSrc[1]) extracted = mSrc[1];
+          }
+          if (!extracted) {
+            const mPath = html.match(/(\/hosts\/[^"'\s>]+\/files\/food\/[^"'\s>]+)/i) || html.match(/(\/files\/food\/[^"'\s>]+)/i);
+            if (mPath && mPath[1]) extracted = mPath[1];
+          }
+
+          if (extracted) {
+            const scheme = String(cur || "").toLowerCase().startsWith("http://") ? "http" : "https";
+            // make absolute
+            if (!/^https?:\/\//i.test(extracted)) {
+              extracted = extracted.startsWith("/")
+                ? `${scheme}://${HAFS_HOST}${extracted}`
+                : `${scheme}://${HAFS_HOST}/${extracted}`;
+            } else {
+              extracted = extracted.replace(/^https:\/\//i, `${scheme}://`);
+            }
+
+            // Prefer HTTP first
+            cur = extracted.replace(/^https:\/\//i, "http://");
+            continue;
+          }
+
+          // If we couldn't extract an image, treat it as blocked/invalid.
+          const preview = html.slice(0, 180).replace(/\s+/g, " ");
+          console.error("[IMG NOT_IMAGE_HTML]", { cur, ct: ctMaybe, preview });
+          const err = Object.assign(new Error("NOT_IMAGE_HTML"), { code: "NOT_IMAGE_HTML" });
+          throw err;
+        }
+
+        const ctRaw = String(resp.headers["content-type"] || "").toLowerCase();
+        if (!ctRaw.startsWith("image/")) {
+          // Sometimes image servers mislabel; if it's clearly binary and small header doesn't look like html, still allow.
+          const head = buf0.toString("utf-8", 0, Math.min(buf0.length, 80));
+          if (head.includes("<html") || head.includes("<!DOCTYPE")) throw new Error("NOT_IMAGE");
+        }
 
         // Compress if needed
-        const { buf, ct } = await maybeCompress(buf0, ctRaw);
+        const { buf, ct } = await maybeCompress(buf0, ctRaw || "image/jpeg");
 
         // Cache the FINAL payload we send to Kakao
-        imageBinCache.set(raw, { buf, ct, ts: Date.now() });
-        imageBinCache.set(url, { buf, ct, ts: Date.now() });
-
+        imageBinCache.set(rawNormalized, { buf, ct, ts: Date.now() });
+        imageBinCache.set(startUrl, { buf, ct, ts: Date.now() });
         return sendBuf(buf, ct);
+      }
+      throw new Error("TOO_MANY_REDIRECTS");
+    };
+
+    let lastErr = null;
+    const candidates = [httpRaw, httpIp, httpsRaw, httpsIp].filter(Boolean);
+    let sent = false;
+    for (const url of candidates) {
+      try {
+        await tryFetchImage(url);
+        sent = true;
+        break;
       } catch (e) {
         lastErr = e;
       }
     }
+    if (sent) return;
 
-    // 2) axios가 막히면 Playwright로 쿠키/세션 우회 → axios 재시도
+    // 2) axios가 막히면 Playwright로 쿠키/세션 우회 → (같은 이미지 fetch 로직으로) 재시도
     try {
-      await fetchHtmlWithPlaywright(raw, 12000);
+      try {
+        await fetchHtmlWithPlaywright(httpsRaw, 12000);
+      } catch (pwErr) {
+        const msg = String(pwErr?.message || "");
+        // If Playwright is installed but browsers are missing at runtime, surface a clear error.
+        if (msg.includes("Executable doesn't exist") || msg.includes("browserType.launch") || msg.includes("chromium")) {
+          console.error("[IMG PLAYWRIGHT MISSING BROWSER]", msg);
+          return res.status(503).send("PLAYWRIGHT_BROWSER_MISSING");
+        }
+        throw pwErr;
+      }
 
-      // 쿠키 갱신된 상태로 재시도 (https 우선)
-      const retryUrl = httpsRaw;
-      const resp = await axios.get(retryUrl, {
-        responseType: "arraybuffer",
-        timeout: 7000,
-        maxRedirects: 0,
-        validateStatus: (s) => s >= 200 && s < 400,
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          Referer: "https://hafs.hs.kr/",
-          ...(HAFS_COOKIE ? { Cookie: HAFS_COOKIE } : {}),
-        },
-      });
+      // ✅ IMPORTANT:
+      // After Playwright refreshes cookies/session, DO NOT do a naive axios.get(httpsRaw).
+      // The HAFS photo URL is often a popup HTML (`act=lunch.image_pop`) that needs parsing
+      // to reach the real `/files/food/...` image. We already implemented that logic in
+      // `tryFetchImage()`, so reuse it here.
+      try {
+        await tryFetchImage(httpIp || httpRaw);
+        return;
+      } catch (e1) {
+        // fall through to https
+      }
 
-      const ctRaw = String(resp.headers["content-type"] || "").toLowerCase();
-      const buf0 = Buffer.from(resp.data || []);
-      if (isNitro(resp, buf0)) throw Object.assign(new Error("HAFS_FIREWALL_BLOCK"), { code: "HAFS_FIREWALL" });
-      if (!ctRaw.startsWith("image/")) throw new Error("NOT_IMAGE_AFTER_PW");
-
-      const { buf, ct } = await maybeCompress(buf0, ctRaw);
-
-      imageBinCache.set(raw, { buf, ct, ts: Date.now() });
-      imageBinCache.set(httpsRaw, { buf, ct, ts: Date.now() });
-      imageBinCache.set(httpRaw, { buf, ct, ts: Date.now() });
-
-      return sendBuf(buf, ct);
+      await tryFetchImage(httpsIp || httpsRaw);
+      return;
     } catch (e) {
       lastErr = e;
     }
@@ -1163,17 +1514,25 @@ app.get("/img", async (req, res) => {
       console.error("[IMG ERROR] HAFS_FIREWALL", lastErr?.message || lastErr);
       return res.status(503).send("HAFS_FIREWALL");
     }
+    console.error("[IMG ERROR DETAIL]", {
+      code: lastErr?.code,
+      message: lastErr?.message,
+      status: lastErr?.response?.status,
+      location: lastErr?.response?.headers?.location,
+    });
     console.error("[IMG ERROR] Not found", lastErr?.message || lastErr);
-    return res.status(404).send("Not found");
+    return sendTransparentPng(res);
   } catch (err) {
     console.error("[IMG ERROR] Unexpected", err);
-    return res.status(404).send("Not found");
+    return sendTransparentPng(res);
   }
 });
 // Kakao webhook
 app.post("/kakao", async (req, res) => {
   try {
-    const utter = req?.body?.userRequest?.utterance || "";
+    const utter = sanitizeUtterance(req?.body?.userRequest?.utterance || "");
+    const rawUtter = String(req?.body?.userRequest?.utterance || "");
+    console.log("[KAKAO UTTER]", { raw: rawUtter, utter });
     const { when, meal, photoYmd, photoMeal } = parseUtter(utter);
 
     // Photo request (pressed from "식단 사진 보기")
@@ -1202,9 +1561,11 @@ app.post("/kakao", async (req, res) => {
     }
 
     // Menu for empty or unknown
+    const utterForMatch = utter.replace(/[^\p{Script=Hangul}\s]/gu, " ").replace(/\s+/g, " ").trim();
+
     if (
-      !utter ||
-      !["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주"].some((k) => utter.includes(k))
+      !utterForMatch ||
+      !["아침", "점심", "저녁", "오늘", "내일", "이번주", "이번 주"].some((k) => utterForMatch.includes(k))
     ) {
       return res.json(
         kakaoText(
