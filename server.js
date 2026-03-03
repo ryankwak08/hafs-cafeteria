@@ -792,8 +792,8 @@ function sanitizeUtterance(raw) {
   return s1
     // Kakao/clients sometimes send quoted replies like `quote>`
     .replace(/^\s*quote>\s*/i, "")
-    // normalize fullwidth pipe to normal pipe
-    .replace(/｜/g, "|")
+    // normalize fullwidth pipe and Korean vertical bar to normal pipe
+    .replace(/[｜ㅣ]/g, "|")
     // remove zero-width chars
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     // normalize newlines/spaces
@@ -807,16 +807,28 @@ function sanitizeUtterance(raw) {
 function parseUtter(utterRaw) {
   let utter = sanitizeUtterance(utterRaw);
 
-  // Robustness: some clients/quickReplies may send photo commands with `/` instead of `|`
-  // e.g. `사진/20260303|lunch` or `사진/20260303/lunch`
-  // Normalize ONLY when it looks like a photo command to avoid touching normal text.
-  if (/^사진\s*[\/|｜]/.test(utter) || utter.startsWith("사진/")) {
-    utter = utter.replace(/\//g, "|");
-    // Also normalize any accidental duplicated separators
+  // Robustness: photo commands can arrive with different separators (|, /, fullwidth ｜, Korean ㅣ)
+  // and meal keys can be English (breakfast/lunch/dinner) or Korean (아침/점심/저녁/조식/중식/석식)
+  if (/^사진\s*[\/|｜ㅣ]/.test(utter) || utter.startsWith("사진/")) {
+    // normalize separators
+    utter = utter.replace(/[\/｜ㅣ]/g, "|");
+    // collapse accidental duplicate separators
     utter = utter.replace(/\|{2,}/g, "|");
+    // normalize spacing around separators
     utter = utter.replace(/\s*\|\s*/g, "|");
+    // normalize prefix
     utter = utter.replace(/^\s*사진\s*\|/g, "사진|");
   }
+
+  // Helper to normalize meal key into (breakfast|lunch|dinner)
+  const normalizeMealKey = (mk) => {
+    const s = String(mk || "").trim().toLowerCase();
+    if (s === "breakfast" || s === "lunch" || s === "dinner") return s;
+    if (s === "아침" || s === "조식") return "breakfast";
+    if (s === "점심" || s === "중식") return "lunch";
+    if (s === "저녁" || s === "석식") return "dinner";
+    return null;
+  };
 
   // Photo request: tolerate variations like
   // - "사진|YYYYMMDD|breakfast"
@@ -830,18 +842,18 @@ function parseUtter(utterRaw) {
     // Accept: ["사진", "YYYYMMDD", "meal"] (+ ignore extras)
     if (parts.length >= 3 && parts[0] === "사진") {
       const ymd = parts[1];
-      const mealKey = String(parts[2]).toLowerCase();
-      if (/^\d{8}$/.test(ymd) && ["breakfast", "lunch", "dinner"].includes(mealKey)) {
+      const mealKey = normalizeMealKey(parts[2]);
+      if (/^\d{8}$/.test(ymd) && mealKey) {
         return { utter: `사진|${ymd}|${mealKey}`, when: "photo", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
       }
     }
 
     // Fallback: regex (allows trailing pipe/whitespace)
-    const m = utter.match(/^사진\|(\d{8})\|(breakfast|lunch|dinner)(?:\|.*)?$/i);
+    const m = utter.match(/^사진\|(\d{8})\|([^|]+)(?:\|.*)?$/i);
     if (m) {
       const ymd = String(m[1] || "").trim();
-      const mealKey = String(m[2] || "").trim().toLowerCase();
-      if (/^\d{8}$/.test(ymd) && ["breakfast", "lunch", "dinner"].includes(mealKey)) {
+      const mealKey = normalizeMealKey(m[2]);
+      if (/^\d{8}$/.test(ymd) && mealKey) {
         return { utter: `사진|${ymd}|${mealKey}`, when: "photo", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
       }
     }
@@ -1522,24 +1534,17 @@ app.post("/kakao", async (req, res) => {
     const utter = sanitizeUtterance(req?.body?.userRequest?.utterance || "");
     const rawUtter = String(req?.body?.userRequest?.utterance || "");
     console.log("[KAKAO UTTER]", { raw: rawUtter, utter });
-    const { when, meal, photoYmd, photoMeal } = parseUtter(utter);
 
-    // Photo request (pressed from "식단 사진 보기")
-    if (meal === "photo" && when === "photo") {
-      const ymd = photoYmd;
-      const mealKey = photoMeal;
-
-      if (!ymd || !mealKey) {
-        return res.json(kakaoText("식단 사진 요청이 올바르지 않아요. 다시 시도해줘!", null));
-      }
-
+    // ✅ Hard-guard: if this is a photo command, handle it immediately.
+    // Kakao sometimes sends separators that look like pipes (|/｜/ㅣ) or includes odd characters.
+    // We normalize in `parseUtter`, but this early guard prevents falling into the default menu response.
+    const maybePhoto = parseUtter(utter);
+    if (maybePhoto.meal === "photo" && maybePhoto.when === "photo") {
+      const ymd = maybePhoto.photoYmd;
+      const mealKey = maybePhoto.photoMeal;
       try {
         const rawUrl = await fetchMealPhotoUrl(ymd, mealKey);
-        if (!rawUrl) {
-          // If no photo exists, do NOT show any buttons
-          return res.json(kakaoText("식단 사진이 없습니다.", null));
-        }
-
+        if (!rawUrl) return res.json(kakaoText("식단 사진이 없습니다.", null));
         const imgUrl = proxiedImageUrl(rawUrl);
         const title = `📷 (${prettyYmd(ymd)}) ${mealKo(mealKey)}`;
         return res.json(kakaoImageCard(title, imgUrl, title, null));
@@ -1563,6 +1568,8 @@ app.post("/kakao", async (req, res) => {
         )
       );
     }
+
+    const { when, meal, photoYmd, photoMeal } = maybePhoto;
 
     const now = new Date();
     let from, to;
