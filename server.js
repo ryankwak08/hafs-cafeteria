@@ -581,6 +581,58 @@ function extractMealFromText(joinedText, label) {
   return cleaned || null;
 }
 
+function parseMealsFromJoinedText(joinedText) {
+  const lines = String(joinedText || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((l) => l.replace(/\s+/g, " ").trim())
+    .filter((l) => l.length > 0);
+
+  const buckets = {
+    breakfast: [],
+    lunch: [],
+    dinner: [],
+    late: [],
+  };
+
+  const mealKeyFromLine = (line) => {
+    const s = String(line || "");
+    if (/조식|아침/.test(s)) return "breakfast";
+    if (/중식|점심/.test(s)) return "lunch";
+    if (/석식|저녁/.test(s)) return "dinner";
+    if (/야식|<야식>/.test(s)) return "late";
+    return null;
+  };
+
+  let current = null;
+  for (const line of lines) {
+    const marker = mealKeyFromLine(line);
+    if (marker) {
+      current = marker;
+      // marker-only line should not be treated as menu text
+      continue;
+    }
+    if (!current) continue;
+    buckets[current].push(line);
+  }
+
+  // If explicit 야식 marker was not present, try splitting dinner by "<야식>" token.
+  let dinnerRaw = buckets.dinner.join("\n");
+  let lateRaw = buckets.late.join("\n");
+  if (!lateRaw && /<야식>/.test(dinnerRaw)) {
+    const parts = dinnerRaw.split("<야식>");
+    dinnerRaw = (parts[0] || "").trim();
+    lateRaw = (parts.slice(1).join("\n") || "").trim();
+  }
+
+  const breakfast = cleanHafsText(buckets.breakfast.join("\n")) || null;
+  const lunch = cleanHafsText(buckets.lunch.join("\n")) || null;
+  const dinner = cleanHafsText(dinnerRaw) || null;
+  const late = cleanHafsText(lateRaw) || null;
+
+  return { breakfast, lunch, dinner, late };
+}
+
 function splitDinnerAndLate(dinnerAll) {
   if (!dinnerAll) return { dinner: null, late: null };
   if (!dinnerAll.includes("<야식>")) return { dinner: dinnerAll, late: null };
@@ -622,10 +674,7 @@ function parseMonthMeals(html, year, month) {
 
     if (!(joined.includes("조식") || joined.includes("중식") || joined.includes("석식"))) continue;
 
-    const breakfast = extractMealFromText(joined, "조식");
-    const lunch = extractMealFromText(joined, "중식");
-    const dinnerAll = extractMealFromText(joined, "석식");
-    const { dinner, late } = splitDinnerAndLate(dinnerAll);
+    const { breakfast, lunch, dinner, late } = parseMealsFromJoinedText(joined);
 
     if (breakfast || lunch || dinner) {
       map.set(ymd, { breakfast, lunch, dinner, late });
@@ -639,13 +688,7 @@ function parseDayMealsFromPageHtml(html) {
   // Don’t over-scope: some HAFS pages render meal blocks outside expected wrappers.
   // Use the whole HTML as text source.
   const joined = normalizeHtmlToTextKeepingYa(String(html || ""));
-
-  const breakfast = extractMealFromText(joined, "조식");
-  const lunch = extractMealFromText(joined, "중식");
-  const dinnerAll = extractMealFromText(joined, "석식");
-  const { dinner, late } = splitDinnerAndLate(dinnerAll);
-
-  return { breakfast, lunch, dinner, late };
+  return parseMealsFromJoinedText(joined);
 }
 
 // ----------------- Cache -----------------
