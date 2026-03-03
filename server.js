@@ -96,12 +96,18 @@ const BASE_URL = process.env.BASE_URL || "https://hafs-cafeteria.onrender.com";
 
 // ----------------- Kakao UI helpers -----------------
 function menuQuickReplies() {
-  // Only keep meal buttons. (오늘/내일/이번주 buttons removed)
   return [
     { label: "아침", action: "message", messageText: "아침" },
     { label: "점심", action: "message", messageText: "점심" },
     { label: "저녁", action: "message", messageText: "저녁" },
+    { label: "오늘", action: "message", messageText: "오늘" },
+    { label: "내일", action: "message", messageText: "내일" },
+    { label: "이번주", action: "message", messageText: "이번주" },
   ];
+}
+
+function photoQuickReply(ymd, mealKey) {
+  return [{ label: "식단 사진 보기", action: "message", messageText: `사진|${ymd}|${mealKey}` }];
 }
 
 function kakaoText(text, quickReplies = menuQuickReplies()) {
@@ -788,7 +794,7 @@ function parseUtter(utterRaw) {
     const okYmd = /^\d{8}$/.test(ymd);
     const okMeal = ["breakfast", "lunch", "dinner"].includes(mealKey);
     if (okYmd && okMeal) {
-      return { utter, when: "today", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
+      return { utter, when: "photo", meal: "photo", photoYmd: ymd, photoMeal: mealKey };
     }
   }
 
@@ -970,7 +976,7 @@ app.get("/health", (req, res) => {
 app.post("/menu", (req, res) => {
   return res.json(
     kakaoText(
-      "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사(사진 있으면 같이 표시)\n• 오늘/내일/이번주: 전체 식단",
+      "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사\n  - 응답에서 ‘식단 사진 보기’ 버튼으로 사진 확인\n• 오늘/내일/이번주: 전체 식단",
       menuQuickReplies()
     )
   );
@@ -1168,7 +1174,32 @@ app.get("/img", async (req, res) => {
 app.post("/kakao", async (req, res) => {
   try {
     const utter = req?.body?.userRequest?.utterance || "";
-    const { when, meal } = parseUtter(utter);
+    const { when, meal, photoYmd, photoMeal } = parseUtter(utter);
+
+    // Photo request (pressed from "식단 사진 보기")
+    if (meal === "photo" && when === "photo") {
+      const ymd = photoYmd;
+      const mealKey = photoMeal;
+
+      if (!ymd || !mealKey) {
+        return res.json(kakaoText("식단 사진 요청이 올바르지 않아요. 다시 시도해줘!", null));
+      }
+
+      try {
+        const rawUrl = await fetchMealPhotoUrl(ymd, mealKey);
+        if (!rawUrl) {
+          // If no photo exists, do NOT show any buttons
+          return res.json(kakaoText("식단 사진이 없습니다.", null));
+        }
+
+        const imgUrl = proxiedImageUrl(rawUrl);
+        const title = `📷 (${prettyYmd(ymd)}) ${mealKo(mealKey)}`;
+        return res.json(kakaoImageCard(title, imgUrl, title, null));
+      } catch (e) {
+        console.error("[photo-fetch-failed]", { ymd, mealKey, code: e?.code, msg: e?.message });
+        return res.json(kakaoText("식단 사진을 불러오다가 오류가 났어. 잠시 후 다시 시도해줘!", null));
+      }
+    }
 
     // Menu for empty or unknown
     if (
@@ -1222,9 +1253,6 @@ app.post("/kakao", async (req, res) => {
       // This is much faster than month-range parsing under load.
       const dayHtml = await fetchDayInfo(from); // ✅ 한 번만 가져옴
       const info = parseDayMealsFromPageHtml(dayHtml) || {};
-      const photoLinks = extractPhotoLinksFromHtml(dayHtml) || { breakfast: null, lunch: null, dinner: null };
-
-      const rawPhotoUrlForMeal = photoLinks?.[meal] || null;
 
       // Build menu text for the requested meal
       let menuText = null;
@@ -1248,27 +1276,8 @@ app.post("/kakao", async (req, res) => {
 
       const text = `🍽 ${mealKo(meal)}\n📅 ${prettyYmd(from)}\n${menuText}`;
 
-      // ✅ If a photo exists, show it together with the menu (no separate button)
-      if (rawPhotoUrlForMeal) {
-        const imgUrl = proxiedImageUrl(rawPhotoUrlForMeal);
-        console.log("[KAKAO IMAGE]", {
-          t: new Date().toISOString(),
-          meal,
-          ymd: from,
-          rawPhotoUrlForMeal,
-          imgUrl,
-        });
-        return res.json(
-          kakaoImageCard(
-            text,
-            imgUrl,
-            `(${prettyYmd(from)}) ${mealKo(meal)}`,
-            null
-          )
-        );
-      }
-
-      return res.json(kakaoText(text, null));
+      // Only show a single "식단 사진 보기" button for 아침/점심/저녁
+      return res.json(kakaoText(text, photoQuickReply(from, meal)));
     }
 
     // all
