@@ -92,7 +92,7 @@ const httpsAgentHafsIp = new https.Agent({
   servername: "hafs.hs.kr", // keep SNI for cert
 });
 
-const BASE_URL = process.env.BASE_URL || "https://hafs-cafeteria.onrender.com";
+const BASE_URL = (process.env.BASE_URL || "").trim();
 
 // ----------------- Kakao UI helpers -----------------
 function menuQuickReplies() {
@@ -840,7 +840,7 @@ function parseUtter(utterRaw) {
     const parts = utter.split("|").map((p) => String(p || "").trim()).filter((p) => p.length > 0);
 
     // Accept: ["사진", "YYYYMMDD", "meal"] (+ ignore extras)
-    if (parts.length >= 3 && parts[0] === "사진") {
+    if (parts.length >= 3 && parts[0] && parts[0].startsWith("사진")) {
       const ymd = parts[1];
       const mealKey = normalizeMealKey(parts[2]);
       if (/^\d{8}$/.test(ymd) && mealKey) {
@@ -1089,9 +1089,19 @@ const photoUrlCache = new Map();
 const PHOTO_URL_TTL_MS = 30 * 60 * 1000;
 
 
-function proxiedImageUrl(rawUrl) {
+function resolvePublicBaseUrl(req) {
+  if (BASE_URL) return BASE_URL.replace(/\/+$/, "");
+  const protoHeader = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim();
+  const hostHeader = String(req?.headers?.["x-forwarded-host"] || req?.headers?.host || "").split(",")[0].trim();
+  const proto = protoHeader || req?.protocol || "https";
+  if (!hostHeader) return "https://hafs-cafeteria.onrender.com";
+  return `${proto}://${hostHeader}`.replace(/\/+$/, "");
+}
+
+function proxiedImageUrl(rawUrl, req) {
   if (!rawUrl) return null;
-  return `${BASE_URL}/img?url=${encodeURIComponent(rawUrl)}`;
+  const base = resolvePublicBaseUrl(req);
+  return `${base}/img?url=${encodeURIComponent(rawUrl)}`;
 }
 
 function mealKo(meal) {
@@ -1545,7 +1555,7 @@ app.post("/kakao", async (req, res) => {
       try {
         const rawUrl = await fetchMealPhotoUrl(ymd, mealKey);
         if (!rawUrl) return res.json(kakaoText("식단 사진이 없습니다.", null));
-        const imgUrl = proxiedImageUrl(rawUrl);
+        const imgUrl = proxiedImageUrl(rawUrl, req);
         const title = `📷 (${prettyYmd(ymd)}) ${mealKo(mealKey)}`;
         return res.json(kakaoImageCard(title, imgUrl, title, null));
       } catch (e) {
