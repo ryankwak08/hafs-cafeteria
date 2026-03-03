@@ -604,8 +604,19 @@ function parseMealsFromJoinedText(joinedText) {
     return null;
   };
 
+  const hardStopByLine = (line) => {
+    const s = String(line || "");
+    return (
+      /교육 행정 메뉴열기|QUICK|MENU|TOP|개인정보처리방침|저작권지침및신고|이메일무단수집거부|COPYRIGHT/i.test(s) ||
+      /대표번호|당직실|FAX|우\)\s*\d{5}/.test(s) ||
+      /학교운영위원회|발전기금|민원발급|배너모음|더보기|시작|멈춤|이전|다음/.test(s)
+    );
+  };
+
   let current = null;
   for (const line of lines) {
+    if (hardStopByLine(line)) break;
+
     const marker = mealKeyFromLine(line);
     if (marker) {
       current = marker;
