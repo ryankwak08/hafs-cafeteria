@@ -1134,15 +1134,10 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-// Welcome/menu endpoint
-app.post("/menu", (req, res) => {
-  return res.json(
-    kakaoText(
-      "원하는 버튼을 눌러 급식을 확인해주세요.\n\n• 아침/점심/저녁: 오늘 해당 식사\n  - 응답에서 ‘식단 사진 보기’ 버튼으로 사진 확인\n• 오늘/내일/이번주: 전체 식단",
-      menuQuickReplies()
-    )
-  );
-});
+// NOTE:
+// In some Kakao/OpenBuilder flows, user utterances can hit /menu instead of /kakao.
+// Route both endpoints to the same webhook handler so photo/menu intents work consistently.
+app.post("/menu", handleKakaoWebhook);
 
 // Optional image proxy (used by photo features)
 // Kakao fetches the image from imageUrl server-side. If the file is too large/slow, Kakao may time out.
@@ -1552,8 +1547,8 @@ app.get("/img", async (req, res) => {
     return sendTransparentPng(res);
   }
 });
-// Kakao webhook
-app.post("/kakao", async (req, res) => {
+// Kakao webhook handler (shared by /kakao and /menu)
+async function handleKakaoWebhook(req, res) {
   try {
     const utter = sanitizeUtterance(req?.body?.userRequest?.utterance || "");
     const rawUtter = String(req?.body?.userRequest?.utterance || "");
@@ -1701,7 +1696,9 @@ app.post("/kakao", async (req, res) => {
 
     return res.json(kakaoText("급식 불러오다가 오류가 났어. 잠시 후 다시 시도해줘!"));
   }
-});
+}
+
+app.post("/kakao", handleKakaoWebhook);
 
 // Run
 const PORT = process.env.PORT || 3000;
