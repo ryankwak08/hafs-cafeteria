@@ -1028,6 +1028,40 @@ function extractPhotoLinksFromHtml(html) {
     return null;
   };
 
+  // Prefer a candidate that appears *after* the meal label marker
+  // inside a tight scope to avoid mixing meals (e.g., lunch -> breakfast photo).
+  const pickAfterMarker = ($marker, $scope) => {
+    if (!$marker || !$scope || $marker.length === 0 || $scope.length === 0) return null;
+    const markerEl = $marker.get(0);
+    if (!markerEl) return null;
+
+    const nodes = $scope.find("*").toArray();
+    const idx = nodes.findIndex((n) => n === markerEl);
+    if (idx < 0) return null;
+
+    for (let i = idx + 1; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (!n || !n.name) continue;
+      const $n = $(n);
+      const tag = String(n.name || "").toLowerCase();
+
+      if (tag === "a") {
+        const href = $n.attr("href") || "";
+        const onclick = $n.attr("onclick") || "";
+        const cand = extractPopupOrPath(href) || extractPopupOrPath(onclick);
+        if (cand && looksLikeFood(cand)) return toAbs(cand);
+      }
+
+      if (tag === "img") {
+        const src = $n.attr("src") || $n.attr("data-src") || $n.attr("data-original") || "";
+        const cand = extractPopupOrPath(src) || src;
+        if (cand && looksLikeFood(cand)) return toAbs(cand);
+      }
+    }
+
+    return null;
+  };
+
   // DOM-first: find the meal label marker and search in its nearest container.
   // This avoids the classic bug where "중식" search accidentally grabs the first photo (조식).
   const findByLabel = (label) => {
@@ -1039,12 +1073,24 @@ function extractPhotoLinksFromHtml(html) {
     for (const el of markers) {
       const $m = $(el);
 
+      // 1) Tight, directional scopes first (after the marker only)
+      const directionalScopes = [
+        $m.parent(),
+        $m.closest("td"),
+        $m.closest("tr"),
+      ].filter((x) => x && x.length);
+
+      for (const sc of directionalScopes) {
+        const url = pickAfterMarker($m, sc);
+        if (url) return url;
+      }
+
       // Try several reasonable containers, from tight to broad
       const scopes = [
         $m.parent(),
-        $m.closest(".meal, .lunch, .lunch_list, .food, .menu, .tbl, .box, td, tr, table"),
+        $m.closest(".meal, .lunch, .lunch_list, .food, .menu, .tbl, .box, td, tr"),
         $m.closest("td"),
-        $m.closest("table"),
+        $m.closest("tr"),
       ].filter((x) => x && x.length);
 
       for (const sc of scopes) {
