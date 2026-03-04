@@ -1109,8 +1109,14 @@ function extractPhotoLinksFromHtml(html) {
   result.lunch = findByLabel("중식");
   result.dinner = findByLabel("석식");
 
-  // 2) Fallback fill: collect all unique food images on the page, then fill missing slots
-  // WITHOUT duplicating already used ones.
+  // 2) Conservative fallback:
+  // Only use order-based fill when *all* label matches failed.
+  // If some labels matched and others didn't, do not cross-fill missing meals
+  // (prevents lunch/dinner from accidentally reusing breakfast photo).
+  const anyLabelMatched = Boolean(result.breakfast || result.lunch || result.dinner);
+  if (anyLabelMatched) return result;
+
+  // No labels matched at all -> fill by appearance order as last resort.
   const ordered = [];
   $("a").each((_, a) => {
     const $a = $(a);
@@ -1136,21 +1142,17 @@ function extractPhotoLinksFromHtml(html) {
     uniq.push(u);
   }
 
-  const used = new Set(Object.values(result).filter(Boolean));
-  for (const k of ["breakfast", "lunch", "dinner"]) {
-    if (result[k]) continue;
-    const next = uniq.find((u) => u && !used.has(u));
-    if (next) {
-      result[k] = next;
-      used.add(next);
-    }
+  for (let i = 0; i < 3; i++) {
+    const meal = i === 0 ? "breakfast" : i === 1 ? "lunch" : "dinner";
+    if (uniq[i]) result[meal] = uniq[i];
   }
 
   return result;
 }
 
 async function fetchMealPhotoUrl(ymd, mealKey) {
-  const key = `${ymd}|${mealKey}`;
+  // versioned cache key to avoid serving stale cross-mapped entries
+  const key = `v2|${ymd}|${mealKey}`;
   const cached = photoUrlCache.get(key);
   const now = Date.now();
 
@@ -1161,6 +1163,14 @@ async function fetchMealPhotoUrl(ymd, mealKey) {
   const html = await fetchDayInfo(ymd);
   const map = extractPhotoLinksFromHtml(html);
   let url = map?.[mealKey] || null;
+  console.log("[PHOTO MAP]", {
+    ymd,
+    mealKey,
+    picked: url || null,
+    breakfast: map?.breakfast || null,
+    lunch: map?.lunch || null,
+    dinner: map?.dinner || null,
+  });
 
   // Normalize HAFS popup URL (act=lunch.image_pop&img=...) -> direct image URL
   const normalizePopupToDirect = (input) => {
