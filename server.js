@@ -93,6 +93,7 @@ const httpsAgentHafsIp = new https.Agent({
 });
 
 const BASE_URL = (process.env.BASE_URL || "").trim();
+const MEAL_SURVEY_URL = "https://att.nownsurvey.com/att/intro/r54vzk6kcb4f";
 
 // ----------------- Kakao UI helpers -----------------
 function menuQuickReplies() {
@@ -109,6 +110,15 @@ function menuQuickReplies() {
 function photoQuickReply(ymd, mealKey) {
   const mealKor = mealKey === "breakfast" ? "아침" : mealKey === "lunch" ? "점심" : mealKey === "dinner" ? "저녁" : mealKey;
   return [{ label: "식단 사진 보기", action: "message", messageText: `사진 ${ymd} ${mealKor}` }];
+}
+
+function surveyQuickReply() {
+  return { label: "급식 만족도 조사", action: "webLink", webLinkUrl: MEAL_SURVEY_URL };
+}
+
+function withSurveyQuickReply(quickReplies = []) {
+  const items = Array.isArray(quickReplies) ? quickReplies : [];
+  return [...items, surveyQuickReply()];
 }
 
 function kakaoText(text, quickReplies = menuQuickReplies()) {
@@ -342,8 +352,8 @@ function resolveRedirectUrl(currentUrl, location) {
   }
 }
 
-function toIpUrl(originalUrl) {
-  if (!HAFS_IP_FALLBACK) return originalUrl;
+function toIpUrl(originalUrl, useFallbackIp = false) {
+  if (!useFallbackIp || !HAFS_IP_FALLBACK) return originalUrl;
   try {
     const u = new URL(originalUrl);
     u.hostname = HAFS_IP_FALLBACK;
@@ -351,6 +361,11 @@ function toIpUrl(originalUrl) {
   } catch {
     return originalUrl;
   }
+}
+
+function isDnsFailure(err) {
+  const code = String(err?.code || "");
+  return code === "ENOTFOUND" || code === "EAI_AGAIN";
 }
 
 async function getHtmlArrayBuffer(url, timeoutMs = 7000) {
@@ -364,10 +379,10 @@ async function getHtmlArrayBuffer(url, timeoutMs = 7000) {
   const httpUrl = String(url).replace(/^https:\/\//i, "http://");
   const candidates = [httpUrl, httpsUrl];
 
-  const tryAxios = async (u) => {
-    // Some environments have DNS issues; allow IP fallback.
-    const ipUrl = toIpUrl(u);
-    const useIp = HAFS_IP_FALLBACK && ipUrl !== u;
+  const tryAxios = async (u, useFallbackIp = false) => {
+    // Some environments have DNS issues; allow IP fallback after hostname attempts.
+    const ipUrl = toIpUrl(u, useFallbackIp);
+    const useIp = useFallbackIp && HAFS_IP_FALLBACK && ipUrl !== u;
 
     const resp = await axios.get(ipUrl, {
       responseType: "arraybuffer",
@@ -403,17 +418,19 @@ async function getHtmlArrayBuffer(url, timeoutMs = 7000) {
         err.code = "HAFS_FIREWALL";
         throw err;
       }
-      const resp2 = await axios.get(toIpUrl(nextUrl), {
+      const nextIpUrl = toIpUrl(nextUrl, useFallbackIp);
+      const useNextIp = useFallbackIp && HAFS_IP_FALLBACK && nextIpUrl !== nextUrl;
+      const resp2 = await axios.get(nextIpUrl, {
         responseType: "arraybuffer",
         timeout: Math.min(Math.max(timeoutMs, 2500), 6000),
         maxRedirects: 0,
         validateStatus: (s) => (s >= 200 && s < 300) || (s >= 300 && s < 400),
         headers: {
           ...headers,
-          ...(HAFS_IP_FALLBACK && toIpUrl(nextUrl) !== nextUrl ? { Host: HAFS_HOST } : {}),
+          ...(useNextIp ? { Host: HAFS_HOST } : {}),
         },
         httpAgent,
-        httpsAgent: (HAFS_IP_FALLBACK && toIpUrl(nextUrl) !== nextUrl) ? httpsAgentHafsIp : httpsAgent,
+        httpsAgent: useNextIp ? httpsAgentHafsIp : httpsAgent,
       });
       updateCookieFromResponse(resp2);
       if (isRedirect(resp2) && isFirewall(resp2)) {
@@ -435,13 +452,27 @@ async function getHtmlArrayBuffer(url, timeoutMs = 7000) {
   };
 
   let lastErr = null;
+  let sawDnsFailure = false;
+
   for (const u of candidates) {
     try {
-      return await tryAxios(u);
+      return await tryAxios(u, false);
     } catch (e) {
       lastErr = e;
-      // If it wasn't a firewall error, continue to next scheme.
+      if (isDnsFailure(e)) sawDnsFailure = true;
       continue;
+    }
+  }
+
+  // Only after hostname DNS failures, try the optional IP fallback.
+  if (HAFS_IP_FALLBACK && sawDnsFailure) {
+    for (const u of candidates) {
+      try {
+        return await tryAxios(u, true);
+      } catch (e) {
+        lastErr = e;
+        continue;
+      }
     }
   }
 
@@ -1746,7 +1777,33 @@ async function handleKakaoWebhook(req, res) {
       }
 
       const text = `📅 ${prettyYmd(from)}\n${chunks.join("\n\n")}`;
-      return res.json(kakaoText(text, null));
+      return res.json(kakaoText(text, withSurveyQuickReply()));
+    }
+
+    // Single-meal buttons: fetch just the day page and parse it.
+    // This avoids a month scrape before "점심"/"아침"/"저녁", which can fail or take too long.
+    if (meal !== "all" && from === to) {
+      const dayHtml = await fetchDayInfo(from);
+      const info = parseDayMealsFromPageHtml(dayHtml) || {};
+
+      let menuText = null;
+      if (meal === "breakfast") menuText = info.breakfast || null;
+      else if (meal === "lunch") menuText = info.lunch || null;
+      else if (meal === "dinner") {
+        if (info.dinner) {
+          menuText = info.dinner;
+          if (info.late) menuText += `\n\n<야식>\n${info.late}`;
+        }
+      }
+
+      if (!menuText) {
+        return res.json(
+          kakaoText(`🍽 ${mealKo(meal)} 정보가 아직 등록되지 않았거나 오늘은 제공되지 않습니다.\n📅 ${prettyYmd(from)}`, null)
+        );
+      }
+
+      const text = `🍽 ${mealKo(meal)}\n📅 ${prettyYmd(from)}\n${menuText}`;
+      return res.json(kakaoText(text, withSurveyQuickReply(photoQuickReply(from, meal))));
     }
 
     // Fetch range map via month scrape (1~2 requests)
@@ -1763,39 +1820,6 @@ async function handleKakaoWebhook(req, res) {
           "해당 날짜의 급식 정보가 아직 등록되지 않았거나 제공되지 않는 날입니다."
         )
       );
-    }
-
-    // single meal
-    if (meal !== "all" && from === to) {
-      // Fast path for single-meal buttons: fetch just the day page and parse it.
-      // This is much faster than month-range parsing under load.
-      const dayHtml = await fetchDayInfo(from); // ✅ 한 번만 가져옴
-      const info = parseDayMealsFromPageHtml(dayHtml) || {};
-
-      // Build menu text for the requested meal
-      let menuText = null;
-      if (meal === "breakfast") menuText = info.breakfast || null;
-      else if (meal === "lunch") menuText = info.lunch || null;
-      else if (meal === "dinner") {
-        if (info.dinner) {
-          menuText = info.dinner;
-          if (info.late) menuText += `\n\n<야식>\n${info.late}`;
-        } else {
-          menuText = null;
-        }
-      }
-
-      if (!menuText) {
-        // No menu for this meal (or blocked/empty)
-        return res.json(
-          kakaoText(`🍽 ${mealKo(meal)} 정보가 아직 등록되지 않았거나 오늘은 제공되지 않습니다.\n📅 ${prettyYmd(from)}`, null)
-        );
-      }
-
-      const text = `🍽 ${mealKo(meal)}\n📅 ${prettyYmd(from)}\n${menuText}`;
-
-      // Only show a single "식단 사진 보기" button for 아침/점심/저녁
-      return res.json(kakaoText(text, photoQuickReply(from, meal)));
     }
 
     // all
@@ -1815,7 +1839,7 @@ async function handleKakaoWebhook(req, res) {
       })
       .join("\n\n──────────\n\n");
 
-    return res.json(kakaoText(text, null));
+    return res.json(kakaoText(text, withSurveyQuickReply()));
   } catch (err) {
     const code = err?.code || "";
     const msg = err?.message || "";
