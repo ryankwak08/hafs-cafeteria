@@ -112,8 +112,19 @@ function photoQuickReply(ymd, mealKey) {
   return [{ label: "식단 사진 보기", action: "message", messageText: `사진 ${ymd} ${mealKor}` }];
 }
 
+function photoQuickRepliesForMeals(ymd, info = {}) {
+  const meals = [
+    ["breakfast", "조식 사진", info.breakfast],
+    ["lunch", "중식 사진", info.lunch],
+    ["dinner", "석식 사진", info.dinner],
+  ];
+  return meals
+    .filter(([, , menuText]) => Boolean(menuText))
+    .map(([mealKey, label]) => ({ label, action: "message", messageText: `사진 ${ymd} ${mealKey}` }));
+}
+
 function surveyQuickReply() {
-  return { label: "급식 만족도 조사", action: "webLink", webLinkUrl: MEAL_SURVEY_URL };
+  return { label: "만족도 조사", action: "message", messageText: "만족도 조사" };
 }
 
 function withSurveyQuickReply(quickReplies = []) {
@@ -141,6 +152,24 @@ function kakaoImageCard(titleText, imageUrl, altText, quickReplies = null) {
     tpl.quickReplies = quickReplies;
   }
   return { version: "2.0", template: tpl };
+}
+
+function kakaoSurveyCard() {
+  return {
+    version: "2.0",
+    template: {
+      outputs: [
+        {
+          basicCard: {
+            title: "급식 만족도 조사",
+            description: "아래 버튼을 눌러 만족도 조사를 열어주세요.",
+            buttons: [{ label: "조사 열기", action: "webLink", webLinkUrl: MEAL_SURVEY_URL }],
+          },
+        },
+      ],
+      quickReplies: menuQuickReplies(),
+    },
+  };
 }
 
 
@@ -1719,6 +1748,10 @@ async function handleKakaoWebhook(req, res) {
       }
     }
 
+    if (utter.includes("만족도") || utter.includes("조사")) {
+      return res.json(kakaoSurveyCard());
+    }
+
     // Menu for empty or unknown
     const utterForMatch = utter.replace(/[^\p{Script=Hangul}\s]/gu, " ").replace(/\s+/g, " ").trim();
 
@@ -1777,7 +1810,7 @@ async function handleKakaoWebhook(req, res) {
       }
 
       const text = `📅 ${prettyYmd(from)}\n${chunks.join("\n\n")}`;
-      return res.json(kakaoText(text, withSurveyQuickReply()));
+      return res.json(kakaoText(text, withSurveyQuickReply(photoQuickRepliesForMeals(from, info))));
     }
 
     // Single-meal buttons: fetch just the day page and parse it.
